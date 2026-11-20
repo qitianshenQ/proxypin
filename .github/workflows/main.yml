@@ -1,0 +1,571 @@
+# =============================================================================
+# ProxyPin 全平台自动构建（fork 专用）
+#
+# 放到你自己 fork 仓库的：.github/workflows/build-all-platforms.yml
+#
+# 设计要点：
+# 1. 默认直接 checkout 上游 wanghongenpin/proxypin 的 main，保证每次都是"最新代码"；
+#    想编译自己 fork 的改动，把手动运行的 source_repo / ref 改成你的仓库和分支即可。
+# 2. 五个平台并行构建，产物覆盖：
+#      Android -> apk + aab
+#      iOS     -> 未签名 .app zip（可选签名 ipa）
+#      Windows -> zip + Inno Setup exe 安装包
+#      macOS   -> zip + dmg
+#      Linux   -> tar.gz + deb
+# 3. 不依赖 flutter_distributor / fastforge，用 flutter build 原生命令 +
+#    各平台自带打包工具，CI 里更少断点。
+# 4. 产物先上传 Artifacts，再由 release job 合并成一个包；
+#    push v* tag、每周定时任务、或手动勾选 publish_release 时自动发到 Release。
+# 5. 签名：Android 的 build.gradle 强制读 android/key.properties，CI 会自动生成
+#    临时密钥（正式发布请配 ANDROID_* secrets）；iOS 默认出未签名包，
+#    正式 IPA 需自备证书/描述文件并勾选 sign_ios；桌面端不做数字签名。
+#
+# 使用前请在 fork 仓库 Settings -> Actions -> General -> Workflow permissions
+# 选择 "Read and write permissions"（本文件已声明 permissions: contents: write）。
+# =============================================================================
+
+name: ProxyPin 全平台构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源码仓库；留空 = 上游 wanghongenpin/proxypin（最新）'
+        required: false
+        default: ''
+      ref:
+        description: '分支 / tag / commit；留空 = 当前 ref（定时与手动为 main，tag 推送为该 tag）'
+        required: false
+        default: ''
+      flutter_version:
+        description: 'Flutter 版本；留空 = stable 最新，若 pub get 报 SDK 冲突可填 3.47.9 / 3.41.2'
+        required: false
+        default: ''
+      publish_release:
+        description: '是否额外发布到 GitHub Release（push v* tag 与定时任务会自动发布）'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release tag；留空自动生成 build-<run_number>'
+        required: false
+        default: ''
+      sign_ios:
+        description: '构建签名 IPA（需自备 IOS_* secrets 与 ios/ExportOptions.plist）'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+  schedule:
+    # 每周一 UTC 02:00（北京时间 10:00）自动拉上游最新代码出一版
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: ${{ inputs.source_repo || 'wanghongenpin/proxypin' }}
+  SOURCE_REF: ${{ inputs.ref || github.ref_name }}
+  FLUTTER_VERSION: ${{ inputs.flutter_version }}
+  RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('build-{0}', github.run_number) }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android (APK / AAB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'          # 项目 Gradle 8.11.1 需要 JDK 17
+          cache: gradle
+
+      # 项目 android/app/build.gradle 的 release 会读取 android/key.properties，
+      # CI 里缺这个文件会让签名配置为空、validateSigningRelease 直接失败。
+      # 优先用 secrets 中的正式 keystore，否则临时生成一把 CI 密钥（仅用于自测分发）。
+      - name: Prepare Android signing
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            STORE_FILE="$RUNNER_TEMP/release.jks"
+          else
+            STORE_FILE="$RUNNER_TEMP/ci-release.jks"
+            keytool -genkey -v -keystore "$STORE_FILE" -alias proxypin-ci \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass proxypin-ci -keypass proxypin-ci \
+              -dname "CN=ProxyPin CI, OU=CI, O=ProxyPin, L=NA, S=NA, C=US" >/dev/null 2>&1
+            STORE_PASSWORD=proxypin-ci
+            KEY_PASSWORD=proxypin-ci
+            KEY_ALIAS=proxypin-ci
+          fi
+          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=%s\n' \
+            "$STORE_PASSWORD" "$KEY_PASSWORD" "$KEY_ALIAS" "$STORE_FILE" > android/key.properties
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}   # 留空即最新 stable
+          cache: true
+
+      - name: Prepare
+        shell: bash
+        run: |
+          flutter --version
+          flutter pub get
+          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+
+      - name: Build APK & AAB
+        shell: bash
+        run: |
+          flutter build apk --release
+          flutter build appbundle --release
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          APK=$(find build -type f -name '*.apk' | head -1)
+          AAB=$(find build -type f -name '*.aab' | head -1)
+          [ -n "$APK" ] && cp "$APK" "dist/proxypin-android-${APP_VERSION}.apk"
+          [ -n "$AAB" ] && cp "$AAB" "dist/proxypin-android-${APP_VERSION}.aab"
+          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
+          flutter --version >> dist/BUILD_INFO.txt
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxypin-android-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  ios:
+    name: iOS (unsigned app / optional IPA)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Prepare
+        shell: bash
+        run: |
+          flutter --version
+          flutter pub get
+          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+
+      # 默认路径：无 Apple 证书也能产出 iOS 产物（Runner.app 打包为 zip）
+      - name: Build unsigned iOS app
+        if: ${{ !inputs.sign_ios }}
+        shell: bash
+        run: |
+          flutter build ios --release --no-codesign
+          APP=$(find build/ios -type d -name '*.app' -prune | head -1)
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" "dist/proxypin-ios-${APP_VERSION}-unsigned.zip"
+
+      # 可选：签名 IPA。需要自行准备：
+      #   IOS_P12_BASE64 / IOS_P12_PASSWORD / IOS_MOBILEPROVISION_BASE64 /
+      #   IOS_KEYCHAIN_PASSWORD 四个 secrets，以及 ios/ExportOptions.plist。
+      # 注意：项目带 Network Extension (PacketTunnelProvider)，正式签名通常还需要
+      # 专门的 extension 描述文件，请按你的开发者账号自行调整 ExportOptions.plist。
+      - name: Build signed IPA (optional)
+        if: ${{ inputs.sign_ios }}
+        shell: bash
+        env:
+          P12: ${{ secrets.IOS_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          PROVISION: ${{ secrets.IOS_MOBILEPROVISION_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$PROVISION" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -s "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          flutter build ipa --release --export-options-plist ios/ExportOptions.plist
+          mkdir -p dist
+          cp build/ios/ipa/*.ipa "dist/proxypin-ios-${APP_VERSION}.ipa"
+
+      - name: Build meta
+        shell: bash
+        run: |
+          mkdir -p dist
+          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
+          flutter --version >> dist/BUILD_INFO.txt
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxypin-ios-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows (ZIP + EXE installer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Read app version
+        id: ver
+        shell: pwsh
+        run: |
+          $line = (Select-String -Path pubspec.yaml -Pattern '^version:' | Select-Object -First 1).Line
+          $V = ($line -replace '^version:\s*','' -replace "'",'' -replace '"','' -replace '\+.*$','')
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$V"
+          Add-Content -Path $env:GITHUB_ENV -Value "APP_VERSION=$V"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Prepare
+        shell: pwsh
+        run: |
+          flutter --version
+          flutter pub get
+          if (Test-Path l10n.yaml) { flutter gen-l10n }
+
+      - name: Build Windows release
+        shell: pwsh
+        run: flutter build windows --release
+
+      - name: Package ZIP + EXE installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rel = "build/windows/x64/runner/Release"
+          if (-not (Test-Path $rel)) {
+            $rel = (Get-ChildItem -Path build/windows -Directory -Recurse -Filter Release | Select-Object -First 1).FullName
+          }
+          $exe = (Get-ChildItem -Path $rel -Filter *.exe | Select-Object -First 1).Name
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+          Compress-Archive -Path "$rel\*" -DestinationPath "dist\proxypin-windows-$env:APP_VERSION.zip" -Force
+
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = 'iscc' }
+
+          $iss = @(
+            '[Setup]',
+            'AppId={{502cbca5-a7f1-4f8f-894d-9820bac2e36f}',
+            'AppName=ProxyPin',
+            "AppVersion=$env:APP_VERSION",
+            'AppPublisher=ProxyPin',
+            'DefaultDirName={autopf64}\ProxyPin',
+            'DefaultGroupName=ProxyPin',
+            'OutputDir=dist',
+            "OutputBaseFilename=proxypin-windows-$env:APP_VERSION",
+            'Compression=lzma2',
+            'SolidCompression=yes',
+            'WizardStyle=modern',
+            '[Languages]',
+            'Name: "english"; MessagesFile: "compiler:Default.isl"',
+            '[Tasks]',
+            'Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked',
+            '[Files]',
+            ('Source: "{0}\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs' -f $rel),
+            '[Icons]',
+            ('Name: "{{group}}\ProxyPin"; Filename: "{{app}}\{0}"' -f $exe),
+            ('Name: "{{autodesktop}}\ProxyPin"; Filename: "{{app}}\{0}"; Tasks: desktopicon' -f $exe),
+            '[Run]',
+            ('Filename: "{{app}}\{0}"; Description: "{{cm:LaunchProgram,ProxyPin}}"; Flags: nowait postinstall skipifsilent' -f $exe)
+          )
+          $iss | Set-Content -Path installer.iss -Encoding utf8
+          & "$iscc" installer.iss
+          Get-ChildItem dist | Format-Table -AutoSize
+
+      - name: Build meta
+        shell: pwsh
+        run: |
+          "source_commit=$(git rev-parse HEAD)" | Out-File -FilePath dist/BUILD_INFO.txt -Encoding utf8
+          flutter --version | Out-File -FilePath dist/BUILD_INFO.txt -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxypin-windows-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macOS (ZIP + DMG)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Prepare
+        shell: bash
+        run: |
+          flutter --version
+          flutter pub get
+          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+
+      - name: Build + package macOS
+        shell: bash
+        run: |
+          flutter build macos --release
+          APP=$(find build/macos/Build/Products/Release -type d -name '*.app' -prune | head -1)
+          APPNAME=$(basename "$APP")
+          # 无开发者证书时做 ad-hoc 签名，避免产物完全不可用
+          codesign --force --deep --sign - "$APP" 2>/dev/null || true
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" "dist/proxypin-macos-${APP_VERSION}.zip"
+          brew install create-dmg
+          create-dmg \
+            --volname "ProxyPin ${APP_VERSION}" \
+            --window-pos 200 120 \
+            --window-size 660 400 \
+            --icon-size 100 \
+            --app-drop-link 480 190 \
+            --icon "$APPNAME" 170 190 \
+            --hide-extension "$APPNAME" \
+            "dist/proxypin-macos-${APP_VERSION}.dmg" "$APP" \
+            || echo "::warning::DMG 生成失败，ZIP 产物仍可用"
+
+      - name: Build meta
+        shell: bash
+        run: |
+          mkdir -p dist
+          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
+          flutter --version >> dist/BUILD_INFO.txt
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxypin-macos-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  linux:
+    name: Linux (tar.gz + DEB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Install Linux build deps
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libayatana-appindicator3-dev \
+            libsecret-1-dev libssl-dev libzstd-dev
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Prepare
+        shell: bash
+        run: |
+          flutter config --enable-linux-desktop
+          flutter --version
+          flutter pub get
+          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+
+      - name: Build + package Linux
+        shell: bash
+        run: |
+          flutter build linux --release
+          BUNDLE=build/linux/x64/release/bundle
+          [ -d "$BUNDLE" ] || BUNDLE=$(find build/linux -type d -name bundle | head -1)
+          BIN=$(find "$BUNDLE" -maxdepth 1 -type f -executable | head -1)
+          BINNAME=$(basename "$BIN" 2>/dev/null || echo proxypin)
+          [ -n "$BINNAME" ] || BINNAME=proxypin
+          mkdir -p dist
+
+          tar -czf "dist/proxypin-linux-${APP_VERSION}-x64.tar.gz" -C "$BUNDLE" .
+
+          PKG=build/debpkg
+          rm -rf "$PKG"
+          mkdir -p "$PKG/DEBIAN" "$PKG/opt/proxypin" "$PKG/usr/bin" \
+                   "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/256x256/apps"
+          cp -a "$BUNDLE/." "$PKG/opt/proxypin/"
+          ln -s "/opt/proxypin/$BINNAME" "$PKG/usr/bin/proxypin"
+          printf 'Package: proxypin\nVersion: %s\nSection: net\nPriority: optional\nArchitecture: amd64\nMaintainer: ProxyPin CI\nDescription: Open source HTTP(S) traffic capture tool (Flutter)\n' \
+            "$APP_VERSION" > "$PKG/DEBIAN/control"
+          printf '[Desktop Entry]\nType=Application\nName=ProxyPin\nExec=/opt/proxypin/%s\nIcon=proxypin\nCategories=Network;Development;\nTerminal=false\n' \
+            "$BINNAME" > "$PKG/usr/share/applications/proxypin.desktop"
+          if [ -f assets/icon.png ]; then
+            cp assets/icon.png "$PKG/usr/share/icons/hicolor/256x256/apps/proxypin.png"
+          fi
+          dpkg-deb --build "$PKG" "dist/proxypin-linux-${APP_VERSION}-amd64.deb"
+
+      - name: Build meta
+        shell: bash
+        run: |
+          mkdir -p dist
+          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
+          flutter --version >> dist/BUILD_INFO.txt
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxypin-linux-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  release:
+    name: Collect & Publish
+    needs: [android, ios, windows, macos, linux]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write build info
+        shell: bash
+        run: |
+          mkdir -p dist
+          {
+            echo "ProxyPin all-platform build"
+            echo "source: ${{ env.SOURCE_REPO }} @ ${{ env.SOURCE_REF }}"
+            echo "workflow run: ${{ github.run_id }} / #${{ github.run_number }}"
+            echo "built at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "files:"
+            ls -lh dist
+          } > dist/BUILD_INFO.txt
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxypin-all-${{ steps.ver.outputs.version }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/') || inputs.publish_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ProxyPin ${{ steps.ver.outputs.version }} · all platforms (build ${{ github.run_number }})
+          body_path: dist/BUILD_INFO.txt
+          prerelease: ${{ github.event_name == 'schedule' || inputs.publish_release == true }}
+          generate_release_notes: false
+          fail_on_unmatched_files: false
+          files: |
+            dist/*.apk
+            dist/*.aab
+            dist/*.zip
+            dist/*.exe
+            dist/*.dmg
+            dist/*.deb
+            dist/*.tar.gz
+            dist/BUILD_INFO.txt
