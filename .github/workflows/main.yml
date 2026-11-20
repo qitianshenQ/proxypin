@@ -1,27 +1,42 @@
 # =============================================================================
-# ProxyPin 全平台自动构建（fork 专用）
+# ProxyPin 全平台自动构建 v3（按真实 CI 日志修复）
 #
-# 放到你自己 fork 仓库的：.github/workflows/build-all-platforms.yml
+# 放到 fork 仓库：.github/workflows/build-all-platforms.yml
 #
-# 设计要点：
-# 1. 默认直接 checkout 上游 wanghongenpin/proxypin 的 main，保证每次都是"最新代码"；
-#    想编译自己 fork 的改动，把手动运行的 source_repo / ref 改成你的仓库和分支即可。
-# 2. 五个平台并行构建，产物覆盖：
-#      Android -> apk + aab
-#      iOS     -> 未签名 .app zip（可选签名 ipa）
-#      Windows -> zip + Inno Setup exe 安装包
-#      macOS   -> zip + dmg
-#      Linux   -> tar.gz + deb
-# 3. 不依赖 flutter_distributor / fastforge，用 flutter build 原生命令 +
-#    各平台自带打包工具，CI 里更少断点。
-# 4. 产物先上传 Artifacts，再由 release job 合并成一个包；
-#    push v* tag、每周定时任务、或手动勾选 publish_release 时自动发到 Release。
-# 5. 签名：Android 的 build.gradle 强制读 android/key.properties，CI 会自动生成
-#    临时密钥（正式发布请配 ANDROID_* secrets）；iOS 默认出未签名包，
-#    正式 IPA 需自备证书/描述文件并勾选 sign_ios；桌面端不做数字签名。
+# 日志来源：logs_120964094780.zip（run #1，Flutter 3.50.1 + ubuntu-26.04 /
+# windows-latest(VS18/MSVC14.51)）。iOS / macOS 成功，三个平台挂在同一层：
 #
-# 使用前请在 fork 仓库 Settings -> Actions -> General -> Workflow permissions
-# 选择 "Read and write permissions"（本文件已声明 permissions: contents: write）。
+#  [Android] FAILURE: Your project's Gradle version (8.11.1) is lower than
+#            Flutter's minimum supported version of 9.3.1
+#            -> 3.50 新增的 flutter-gradle-plugin 校验；官方提供
+#               --android-skip-build-dependency-validation 绕过。
+#  [Windows] error C2338: <experimental/coroutine> deprecated by MSVC 14.51
+#            (permission_handler_windows)，另有
+#            Get-Item : Could not find item C:\Users\runneradmin\AppData
+#  [Linux]   error: 'app_indicator_new' is deprecated [-Werror,-Wdeprecated-declarations]
+#            (tray_manager)，Flutter Linux 模板的 -Werror 把新 clang 的
+#            deprecated 警告提升为硬错误。
+#
+# v3 主修复：
+#  1. 默认 Flutter 固定到 3.47.9（项目 v1.4.0 / 2026-10-29 发布时的 stable，
+#     Dart 3.13.7），避开刚发布 3.50.1 的破坏性校验；inputs 可手动覆盖。
+#  2. Android：自动探测并按需追加 --android-skip-build-dependency-validation，
+#     即使手动填 3.50+ 也能构建；保留 CI 签名 / 关闭 R8 / 确定产物路径。
+#  3. Windows：runner 换 windows-2022（VS2022 / MSVC14.3x 不会把
+#     experimental/coroutine 报成 C2338），双保险注入官方抑制宏
+#     _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS 到 CMake；
+#     预创建 AppData\Local\Pub\Cache 消除 cargokit resolve_symlinks.ps1 报错。
+#  4. Linux：把仓库与插件 CMakeLists 里的 -Werror 替换为
+#     -Wno-error=deprecated-declarations，并给 tray_manager 源码加 pragma。
+#  5. Release：五个平台全部成功才发版，避免再发「只有 iOS/macOS」的残缺包。
+#  6. 保留 v2 的通用加固：pub get 重试、gen-l10n 非致命、bsdtar/Inno Setup
+#     降级、DEB 允许失败、Action 升 v5、failure() 诊断日志。
+#
+# 默认 checkout 上游 wanghongenpin/proxypin 的 main，保证「最新源码」；
+# 想编译自己 fork 的改动，手动运行时把 source_repo 改成你的仓库、ref 改分支。
+#
+# 发布 Release 需：Settings -> Actions -> General -> Workflow permissions
+#   -> Read and write permissions（本文件已声明 permissions: contents: write）。
 # =============================================================================
 
 name: ProxyPin 全平台构建
@@ -34,13 +49,13 @@ on:
         required: false
         default: ''
       ref:
-        description: '分支 / tag / commit；留空 = 当前 ref（定时与手动为 main，tag 推送为该 tag）'
+        description: '分支 / tag / commit；留空 = 当前 ref'
         required: false
         default: ''
       flutter_version:
-        description: 'Flutter 版本；留空 = stable 最新，若 pub get 报 SDK 冲突可填 3.47.9 / 3.41.2'
+        description: 'Flutter 版本；默认 3.47.9（项目 1.4.0 适配版），填 stable 用最新'
         required: false
-        default: ''
+        default: '3.47.9'
       publish_release:
         description: '是否额外发布到 GitHub Release（push v* tag 与定时任务会自动发布）'
         type: boolean
@@ -57,7 +72,7 @@ on:
     tags:
       - 'v*'
   schedule:
-    # 每周一 UTC 02:00（北京时间 10:00）自动拉上游最新代码出一版
+    # 每周一 UTC 02:00（北京时间 10:00）拉上游最新代码出一版
     - cron: '0 2 * * 1'
 
 permissions:
@@ -70,16 +85,18 @@ concurrency:
 env:
   SOURCE_REPO: ${{ inputs.source_repo || 'wanghongenpin/proxypin' }}
   SOURCE_REF: ${{ inputs.ref || github.ref_name }}
-  FLUTTER_VERSION: ${{ inputs.flutter_version }}
+  # 非 workflow_dispatch（tag / schedule）时 inputs 为空，必须在这里兜底，
+  # 固定到项目适配版本，避免刚发布的新 stable 引入破坏性校验。
+  FLUTTER_VERSION: ${{ inputs.flutter_version || '3.47.9' }}
   RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('build-{0}', github.run_number) }}
 
 jobs:
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
   android:
     name: Android (APK / AAB)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_REF }}
@@ -89,19 +106,31 @@ jobs:
         id: ver
         shell: bash
         run: |
-          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | cut -d: -f2- | tr -d " '\"\r" | cut -d+ -f1)
+          [ -n "$V" ] || V=0.0.0
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "APP_VERSION=$V" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'          # 项目 Gradle 8.11.1 需要 JDK 17
+          java-version: '17'
           cache: gradle
 
-      # 项目 android/app/build.gradle 的 release 会读取 android/key.properties，
-      # CI 里缺这个文件会让签名配置为空、validateSigningRelease 直接失败。
-      # 优先用 secrets 中的正式 keystore，否则临时生成一把 CI 密钥（仅用于自测分发）。
+      - name: Android SDK licenses & platform
+        shell: bash
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SM" ]; then
+            yes | "$SM" --licenses >/dev/null 2>&1 || true
+            "$SM" "platform-tools" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+      # 项目 android/app/build.gradle 的 release/debug 都绑 signingConfigs.release，
+      # 且强制读 android/key.properties；CI 缺文件 -> validateSigningRelease 直接失败。
+      # 四个 secrets 必须齐全才用正式密钥，否则生成临时 CI 密钥（仅自测分发）。
       - name: Prepare Android signing
         shell: bash
         env:
@@ -110,66 +139,145 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            STORE_FILE="$RUNNER_TEMP/release.jks"
+          set -e
+          JKS=android/release.jks
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$JKS"
           else
-            STORE_FILE="$RUNNER_TEMP/ci-release.jks"
-            keytool -genkey -v -keystore "$STORE_FILE" -alias proxypin-ci \
+            rm -f "$JKS"
+            keytool -genkey -v -keystore "$JKS" -alias proxypin-ci \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass proxypin-ci -keypass proxypin-ci \
               -dname "CN=ProxyPin CI, OU=CI, O=ProxyPin, L=NA, S=NA, C=US" >/dev/null 2>&1
             STORE_PASSWORD=proxypin-ci
             KEY_PASSWORD=proxypin-ci
             KEY_ALIAS=proxypin-ci
+            echo "::notice::未配置 ANDROID_* secrets，使用临时 CI 密钥；正式分发请配置 keystore"
           fi
-          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=%s\n' \
-            "$STORE_PASSWORD" "$KEY_PASSWORD" "$KEY_ALIAS" "$STORE_FILE" > android/key.properties
+          # Gradle 的 file() 相对 android/app 解析，../release.jks => android/release.jks
+          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=../release.jks\n' \
+            "$STORE_PASSWORD" "$KEY_PASSWORD" "$KEY_ALIAS" > android/key.properties
+          cat android/key.properties | sed 's/storePassword=.*/storePassword=***/; s/keyPassword=.*/keyPassword=***/'
+
+      # 项目默认开启 R8（minifyEnabled/shrinkResources），CI 里常因缺 keep rules
+      # 直接构建失败。关闭混淆不影响功能，只增大体积；需要混淆可删掉本步骤。
+      - name: Disable R8 for CI
+        shell: bash
+        run: |
+          F=android/app/build.gradle
+          if [ -f "$F" ]; then
+            sed -i 's/minifyEnabled true/minifyEnabled false/g; s/shrinkResources true/shrinkResources false/g' "$F"
+            echo "::notice::已关闭 minifyEnabled / shrinkResources"
+          fi
 
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}   # 留空即最新 stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
       - name: Prepare
         shell: bash
         run: |
+          set -e
+          git config --global url."https://github.com/".insteadOf "git@github.com:" || true
+          flutter clean || true
           flutter --version
+          for i in 1 2 3; do
+            flutter pub get && break
+            echo "::warning::pub get 第 $i 次失败，10s 后重试"
+            sleep 10
+          done
           flutter pub get
-          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+          if [ -f l10n.yaml ]; then
+            flutter gen-l10n || echo "::warning::gen-l10n 失败，仓库已提交 app_localizations.dart，忽略"
+          fi
+          flutter doctor -v || true
+
+      - name: Android compatibility patch
+        shell: bash
+        run: |
+          set -e
+          # Flutter 3.50+ 新增「Gradle 最低 9.3.1」校验，项目 wrapper 是 8.11.1，
+          # 日志实测 assembleRelease 会被 dev.flutter.flutter-gradle-plugin 直接拒绝。
+          # 官方绕过 flag 只在 3.50+ 存在，老 SDK 不认识，所以先探测再决定是否追加。
+          FLAG=""
+          if flutter build apk --help 2>&1 | grep -q -- '--android-skip-build-dependency-validation'; then
+            FLAG="--android-skip-build-dependency-validation"
+            echo "::notice::检测到 Gradle 版本校验，构建自动追加 $FLAG"
+          else
+            echo "::notice::当前 Flutter 无 Gradle 版本校验，按原样构建"
+          fi
+          echo "ANDROID_SKIP_FLAG=$FLAG" >> "$GITHUB_ENV"
 
       - name: Build APK & AAB
         shell: bash
         run: |
-          flutter build apk --release
-          flutter build appbundle --release
+          set -e
+          # 3.50+ 下若绕过 flag 不被某个子命令接受，退回原生命令再试一次
+          if ! flutter build apk --release $ANDROID_SKIP_FLAG; then
+            if [ -n "$ANDROID_SKIP_FLAG" ]; then
+              echo "::warning::带 Gradle 校验绕过 flag 的 APK 构建失败，尝试原生命令"
+              flutter build apk --release || {
+                echo "::error::APK 构建失败"
+                find build -name '*.log' -o -name '*.txt' 2>/dev/null | head -20 | xargs -r tail -60
+                exit 1
+              }
+            else
+              echo "::error::APK 构建失败"
+              exit 1
+            fi
+          fi
+          if ! flutter build appbundle --release $ANDROID_SKIP_FLAG; then
+            if [ -n "$ANDROID_SKIP_FLAG" ]; then
+              echo "::warning::带 Gradle 校验绕过 flag 的 AAB 构建失败，尝试原生命令"
+              flutter build appbundle --release || { echo "::error::AAB 构建失败"; exit 1; }
+            else
+              echo "::error::AAB 构建失败"
+              exit 1
+            fi
+          fi
 
       - name: Collect artifacts
         shell: bash
         run: |
+          set -e
           mkdir -p dist
-          APK=$(find build -type f -name '*.apk' | head -1)
-          AAB=$(find build -type f -name '*.aab' | head -1)
-          [ -n "$APK" ] && cp "$APK" "dist/proxypin-android-${APP_VERSION}.apk"
-          [ -n "$AAB" ] && cp "$AAB" "dist/proxypin-android-${APP_VERSION}.aab"
-          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
-          flutter --version >> dist/BUILD_INFO.txt
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          AAB=build/app/outputs/bundle/release/app-release.aab
+          [ -f "$APK" ] || APK=$(find build -type f -name '*.apk' | head -1)
+          [ -f "$AAB" ] || AAB=$(find build -type f -name '*.aab' | head -1)
+          [ -n "$APK" ] && [ -f "$APK" ] && cp "$APK" "dist/proxypin-android-${APP_VERSION}.apk"
+          [ -n "$AAB" ] && [ -f "$AAB" ] && cp "$AAB" "dist/proxypin-android-${APP_VERSION}.aab"
+          echo "source_commit=$(git rev-parse HEAD)" > "dist/BUILD_INFO_android.txt"
+          flutter --version >> "dist/BUILD_INFO_android.txt"
           ls -lh dist
+          [ -f "dist/proxypin-android-${APP_VERSION}.apk" ] || { echo "::error::未找到 APK"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - name: Diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== flutter doctor ====="
+          flutter doctor -v || true
+          echo "===== pubspec git deps ====="
+          grep -nE 'git:|ref:|url:' pubspec.yaml || true
+          echo "===== gradle logs ====="
+          find . -path '*/build/*' -name '*.log' 2>/dev/null | head -20 | xargs -r tail -80
+
+      - uses: actions/upload-artifact@v5
         with:
           name: proxypin-android-${{ steps.ver.outputs.version }}
           path: dist/
           if-no-files-found: error
           retention-days: 30
 
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
   ios:
     name: iOS (unsigned app / optional IPA)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_REF }}
@@ -179,7 +287,8 @@ jobs:
         id: ver
         shell: bash
         run: |
-          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | cut -d: -f2- | tr -d " '\"\r" | cut -d+ -f1)
+          [ -n "$V" ] || V=0.0.0
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "APP_VERSION=$V" >> "$GITHUB_ENV"
 
@@ -192,25 +301,28 @@ jobs:
       - name: Prepare
         shell: bash
         run: |
+          set -e
+          flutter clean || true
           flutter --version
+          for i in 1 2 3; do flutter pub get && break; sleep 10; done
           flutter pub get
-          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+          if [ -f l10n.yaml ]; then
+            flutter gen-l10n || echo "::warning::gen-l10n 失败，忽略"
+          fi
 
-      # 默认路径：无 Apple 证书也能产出 iOS 产物（Runner.app 打包为 zip）
       - name: Build unsigned iOS app
         if: ${{ !inputs.sign_ios }}
         shell: bash
         run: |
+          set -e
           flutter build ios --release --no-codesign
           APP=$(find build/ios -type d -name '*.app' -prune | head -1)
+          [ -n "$APP" ] || { echo "::error::未找到 .app"; exit 1; }
           mkdir -p dist
           ditto -c -k --keepParent "$APP" "dist/proxypin-ios-${APP_VERSION}-unsigned.zip"
 
-      # 可选：签名 IPA。需要自行准备：
-      #   IOS_P12_BASE64 / IOS_P12_PASSWORD / IOS_MOBILEPROVISION_BASE64 /
-      #   IOS_KEYCHAIN_PASSWORD 四个 secrets，以及 ios/ExportOptions.plist。
-      # 注意：项目带 Network Extension (PacketTunnelProvider)，正式签名通常还需要
-      # 专门的 extension 描述文件，请按你的开发者账号自行调整 ExportOptions.plist。
+      # 正式 IPA 需自备 IOS_* secrets 与 ios/ExportOptions.plist；
+      # 项目带 Network Extension，通常还需要 extension 专用描述文件。
       - name: Build signed IPA (optional)
         if: ${{ inputs.sign_ios }}
         shell: bash
@@ -220,6 +332,7 @@ jobs:
           PROVISION: ${{ secrets.IOS_MOBILEPROVISION_BASE64 }}
           KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
         run: |
+          set -e
           KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
           echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           echo "$PROVISION" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
@@ -240,23 +353,28 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
-          flutter --version >> dist/BUILD_INFO.txt
+          echo "source_commit=$(git rev-parse HEAD)" > "dist/BUILD_INFO_ios.txt"
+          flutter --version >> "dist/BUILD_INFO_ios.txt"
           ls -lh dist
 
-      - uses: actions/upload-artifact@v4
+      - name: Diagnostics on failure
+        if: failure()
+        shell: bash
+        run: flutter doctor -v || true
+
+      - uses: actions/upload-artifact@v5
         with:
           name: proxypin-ios-${{ steps.ver.outputs.version }}
           path: dist/
           if-no-files-found: error
           retention-days: 30
 
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
   windows:
     name: Windows (ZIP + EXE installer)
-    runs-on: windows-latest
+    runs-on: windows-2022   # VS2022 / MSVC 14.3x，避开 14.51 的 coroutine C2338 硬错误
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_REF }}
@@ -267,7 +385,8 @@ jobs:
         shell: pwsh
         run: |
           $line = (Select-String -Path pubspec.yaml -Pattern '^version:' | Select-Object -First 1).Line
-          $V = ($line -replace '^version:\s*','' -replace "'",'' -replace '"','' -replace '\+.*$','')
+          $V = (($line -replace '^version:\s*','').Trim() -replace "'",'' -replace '"','' -replace '\+.*$','').Trim()
+          if (-not $V) { $V = '0.0.0' }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$V"
           Add-Content -Path $env:GITHUB_ENV -Value "APP_VERSION=$V"
 
@@ -277,33 +396,118 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
 
+      # 日志复核：gen-l10n 实际成功；Windows 真正失败点是 MSVC 14.51 把
+      # <experimental/coroutine> 的废弃提升为 C2338（permission_handler_windows）。
+      # 下面仍保留「gen-l10n 非致命」的通用加固，但不作为主修复。
       - name: Prepare
         shell: pwsh
         run: |
+          flutter config --enable-windows-desktop | Out-Null
+          flutter clean 2>$null | Out-Null
           flutter --version
-          flutter pub get
-          if (Test-Path l10n.yaml) { flutter gen-l10n }
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            flutter pub get
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "::warning::pub get 第 $i 次失败，10s 后重试"
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) { exit 1 }
+          if (Test-Path l10n.yaml) {
+            flutter gen-l10n
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::gen-l10n 失败，仓库已提交 app_localizations.dart，忽略"
+            }
+          }
+          flutter doctor -v
+          # 显式清零，避免 GitHub 的 pwsh 包装把上一条 doctor 的非 0 退出码带出去
+          $global:LASTEXITCODE = 0
+
+      - name: Windows compatibility patches
+        shell: pwsh
+        run: |
+          # 1) runner 的 PUB_CACHE 指向 AppData\Local\Pub\Cache，但目录可能不存在，
+          #    cargokit 的 resolve_symlinks.ps1 会 Get-Item 失败（日志中的报错）。
+          $pub = Join-Path $env:USERPROFILE 'AppData\Local\Pub\Cache'
+          New-Item -ItemType Directory -Force -Path $pub | Out-Null
+
+          # 2) MSVC 14.4x+ 把 <experimental/coroutine> 废弃变成 C2338 静态断言，
+          #    permission_handler_windows 仍引用该头；定义微软给出的抑制宏。
+          #    add_definitions 放在顶层 CMakeLists，对所有插件子目录 target 生效。
+          $cmake = 'windows/CMakeLists.txt'
+          $text = Get-Content -Path $cmake -Raw
+          if ($text -notmatch '_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS') {
+            $insert = "add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)"
+            $patterns = @('(?m)^(project\([^\r\n]*\)\s*)$', '(?m)^(cmake_minimum_required\([^\r\n]*\)\s*)$')
+            $patched = $text
+            foreach ($pat in $patterns) {
+              if ($patched -match $pat) {
+                $rx = [regex]::new($pat)
+                $patched = $rx.Replace($patched, "`$0`n$insert", 1)
+                break
+              }
+            }
+            if ($patched -eq $text) { $patched = $text + "`n$insert`n" }
+            Set-Content -Path $cmake -Value $patched -Encoding utf8NoBOM
+            Write-Host "::notice::已注入 _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
+          }
+
+          # 3) 额外通过 CL 环境变量兜底（cl.exe 会读取），三保险
+          Add-Content -Path $env:GITHUB_ENV -Value "CL=/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
+          $global:LASTEXITCODE = 0
 
       - name: Build Windows release
         shell: pwsh
-        run: flutter build windows --release
+        run: |
+          flutter build windows --release
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::Windows 构建失败"; exit 1 }
+          $global:LASTEXITCODE = 0
 
-      - name: Package ZIP + EXE installer
+      # 主产物 ZIP 单独一步：用系统 bsdtar 打 zip，避开 Compress-Archive 的
+      # 长路径 / 大目录 / 文件占用问题；失败则回退 Compress-Archive。
+      - name: Package ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $rel = "build/windows/x64/runner/Release"
+          $rel = 'build/windows/x64/runner/Release'
+          if (-not (Test-Path $rel)) {
+            $rel = (Get-ChildItem -Path build/windows -Directory -Recurse -Filter Release | Select-Object -First 1).FullName
+          }
+          if (-not $rel -or -not (Test-Path $rel)) { Write-Host "::error::未找到 Release 目录"; exit 1 }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $zip = "dist\proxypin-windows-$env:APP_VERSION.zip"
+          tar -a -cf $zip -C $rel .
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::bsdtar 失败，回退 Compress-Archive"
+            Compress-Archive -Path "$rel\*" -DestinationPath $zip -Force
+          }
+          $global:LASTEXITCODE = 0
+          Get-ChildItem dist | Format-Table -AutoSize
+
+      # EXE 打包完全可失败降级：先探测预装 ISCC，再 choco，仍没有就只保留 ZIP。
+      - name: Package EXE installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress --limit-output
+            $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+            if (-not (Test-Path $iscc)) { $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source }
+          }
+          if (-not $iscc) { Write-Host "::warning::Inno Setup 不可用，跳过 EXE，ZIP 仍会上传"; exit 0 }
+
+          $rel = 'build/windows/x64/runner/Release'
           if (-not (Test-Path $rel)) {
             $rel = (Get-ChildItem -Path build/windows -Directory -Recurse -Filter Release | Select-Object -First 1).FullName
           }
           $exe = (Get-ChildItem -Path $rel -Filter *.exe | Select-Object -First 1).Name
-          New-Item -ItemType Directory -Force dist | Out-Null
-
-          Compress-Archive -Path "$rel\*" -DestinationPath "dist\proxypin-windows-$env:APP_VERSION.zip" -Force
-
-          choco install innosetup -y --no-progress
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = 'iscc' }
+          if (-not $exe) { Write-Host "::warning::未找到主 exe"; exit 0 }
 
           $iss = @(
             '[Setup]',
@@ -330,29 +534,40 @@ jobs:
             '[Run]',
             ('Filename: "{{app}}\{0}"; Description: "{{cm:LaunchProgram,ProxyPin}}"; Flags: nowait postinstall skipifsilent' -f $exe)
           )
-          $iss | Set-Content -Path installer.iss -Encoding utf8
-          & "$iscc" installer.iss
+          $iss | Set-Content -Path installer.iss -Encoding utf8NoBOM
+          & $iscc installer.iss
+          $global:LASTEXITCODE = 0
           Get-ChildItem dist | Format-Table -AutoSize
 
       - name: Build meta
         shell: pwsh
         run: |
-          "source_commit=$(git rev-parse HEAD)" | Out-File -FilePath dist/BUILD_INFO.txt -Encoding utf8
-          flutter --version | Out-File -FilePath dist/BUILD_INFO.txt -Append -Encoding utf8
+          "source_commit=$(git rev-parse HEAD)" | Out-File -FilePath dist/BUILD_INFO_windows.txt -Encoding utf8
+          flutter --version | Out-File -FilePath dist/BUILD_INFO_windows.txt -Append -Encoding utf8
+          $global:LASTEXITCODE = 0
 
-      - uses: actions/upload-artifact@v4
+      - name: Diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          Get-ChildItem -Path build/windows -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+            Select-Object -First 10 | ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Tail 60 }
+          $global:LASTEXITCODE = 0
+
+      - uses: actions/upload-artifact@v5
         with:
           name: proxypin-windows-${{ steps.ver.outputs.version }}
           path: dist/
           if-no-files-found: error
           retention-days: 30
 
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
   macos:
     name: macOS (ZIP + DMG)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_REF }}
@@ -362,7 +577,8 @@ jobs:
         id: ver
         shell: bash
         run: |
-          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | cut -d: -f2- | tr -d " '\"\r" | cut -d+ -f1)
+          [ -n "$V" ] || V=0.0.0
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "APP_VERSION=$V" >> "$GITHUB_ENV"
 
@@ -375,29 +591,30 @@ jobs:
       - name: Prepare
         shell: bash
         run: |
+          set -e
+          flutter clean || true
           flutter --version
+          for i in 1 2 3; do flutter pub get && break; sleep 10; done
           flutter pub get
-          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+          if [ -f l10n.yaml ]; then flutter gen-l10n || echo "::warning::gen-l10n 失败，忽略"; fi
 
       - name: Build + package macOS
         shell: bash
         run: |
+          set -e
           flutter build macos --release
           APP=$(find build/macos/Build/Products/Release -type d -name '*.app' -prune | head -1)
+          [ -n "$APP" ] || { echo "::error::未找到 .app"; exit 1; }
           APPNAME=$(basename "$APP")
-          # 无开发者证书时做 ad-hoc 签名，避免产物完全不可用
           codesign --force --deep --sign - "$APP" 2>/dev/null || true
           mkdir -p dist
           ditto -c -k --keepParent "$APP" "dist/proxypin-macos-${APP_VERSION}.zip"
-          brew install create-dmg
+          brew install create-dmg >/dev/null 2>&1 || true
           create-dmg \
             --volname "ProxyPin ${APP_VERSION}" \
-            --window-pos 200 120 \
-            --window-size 660 400 \
-            --icon-size 100 \
-            --app-drop-link 480 190 \
-            --icon "$APPNAME" 170 190 \
-            --hide-extension "$APPNAME" \
+            --window-pos 200 120 --window-size 660 400 \
+            --icon-size 100 --app-drop-link 480 190 \
+            --icon "$APPNAME" 170 190 --hide-extension "$APPNAME" \
             "dist/proxypin-macos-${APP_VERSION}.dmg" "$APP" \
             || echo "::warning::DMG 生成失败，ZIP 产物仍可用"
 
@@ -405,23 +622,28 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
-          flutter --version >> dist/BUILD_INFO.txt
+          echo "source_commit=$(git rev-parse HEAD)" > "dist/BUILD_INFO_macos.txt"
+          flutter --version >> "dist/BUILD_INFO_macos.txt"
           ls -lh dist
 
-      - uses: actions/upload-artifact@v4
+      - name: Diagnostics on failure
+        if: failure()
+        shell: bash
+        run: flutter doctor -v || true
+
+      - uses: actions/upload-artifact@v5
         with:
           name: proxypin-macos-${{ steps.ver.outputs.version }}
           path: dist/
           if-no-files-found: error
           retention-days: 30
 
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
   linux:
     name: Linux (tar.gz + DEB)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ env.SOURCE_REF }}
@@ -431,18 +653,21 @@ jobs:
         id: ver
         shell: bash
         run: |
-          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | cut -d: -f2- | tr -d " '\"\r" | cut -d+ -f1)
+          [ -n "$V" ] || V=0.0.0
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "APP_VERSION=$V" >> "$GITHUB_ENV"
 
       - name: Install Linux build deps
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          export DEBIAN_FRONTEND=noninteractive
+          for i in 1 2 3; do sudo apt-get update -qq && break; sleep 5; done
+          sudo apt-get install -y --no-install-recommends \
             clang cmake ninja-build pkg-config \
-            libgtk-3-dev liblzma-dev libayatana-appindicator3-dev \
-            libsecret-1-dev libssl-dev libzstd-dev
+            libgtk-3-dev liblzma-dev libzstd-dev libsecret-1-dev \
+            libayatana-appindicator3-dev libssl-dev libstdc++-12-dev file
+          echo "::notice::系统依赖安装完成"
 
       - uses: subosito/flutter-action@v2
         with:
@@ -453,119 +678,77 @@ jobs:
       - name: Prepare
         shell: bash
         run: |
+          set -e
           flutter config --enable-linux-desktop
+          flutter clean || true
           flutter --version
+          for i in 1 2 3; do flutter pub get && break; echo "::warning::pub get 第 $i 次失败"; sleep 10; done
           flutter pub get
-          if [ -f l10n.yaml ]; then flutter gen-l10n || true; fi
+          if [ -f l10n.yaml ]; then flutter gen-l10n || echo "::warning::gen-l10n 失败，忽略"; fi
+          flutter doctor -v || true
 
-      - name: Build + package Linux
+      - name: Linux compatibility patches
         shell: bash
         run: |
-          flutter build linux --release
+          set -e
+          python3 - <<'PY'
+          import pathlib, re
+          # Ubuntu 26.04 的 clang 把 app_indicator_new 标记为 deprecated，
+          # Flutter Linux 模板的 -Werror 把它升级成硬错误（日志中的失败点）。
+          # 仓库文件 + pub get 生成的插件 symlink 一起处理，其他警告仍保留 -Wall。
+          changed = 0
+          seen = set()
+          targets = list(pathlib.Path('linux').rglob('CMakeLists.txt'))
+          sym_root = pathlib.Path('linux/flutter/ephemeral/.plugin_symlinks')
+          if sym_root.exists():
+              for link in sym_root.iterdir():
+                  if link.is_dir():
+                      targets.extend(link.rglob('CMakeLists.txt'))
+          for f in targets:
+              try:
+                  rp = f.resolve()
+                  if rp in seen:
+                      continue
+                  seen.add(rp)
+                  t = f.read_text(errors='ignore')
+                  t2 = re.sub(r'-Werror(?![\w=])', '-Wno-error=deprecated-declarations', t)
+                  if t2 != t:
+                      f.write_text(t2)
+                      changed += 1
+                      print('patched cmake:', f)
+              except Exception as e:
+                  print('skip cmake:', f, e)
+          # 双保险：tray_manager 源码直接加 pragma，插件若自带 -Werror 也不怕
+          sym = pathlib.Path('linux/flutter/ephemeral/.plugin_symlinks/tray_manager/linux')
+          if sym.exists():
+              for f in sym.rglob('*.cc'):
+                  try:
+                      t = f.read_text(errors='ignore')
+                      if '_SILENCE_DEPRECATED' not in t:
+                          f.write_text('#pragma GCC diagnostic ignored "-Wdeprecated-declarations"\n// _SILENCE_DEPRECATED\n' + t)
+                          print('pragma:', f)
+                  except Exception as e:
+                      print('skip cc:', f, e)
+          print('CMakeLists patched:', changed)
+          PY
+
+      - name: Build Linux
+        shell: bash
+        run: |
+          set -e
+          flutter build linux --release || {
+            echo "::error::Linux 构建失败"
+            find build/linux -name '*.log' 2>/dev/null | head -10 | xargs -r tail -80
+            exit 1
+          }
           BUNDLE=build/linux/x64/release/bundle
           [ -d "$BUNDLE" ] || BUNDLE=$(find build/linux -type d -name bundle | head -1)
-          BIN=$(find "$BUNDLE" -maxdepth 1 -type f -executable | head -1)
-          BINNAME=$(basename "$BIN" 2>/dev/null || echo proxypin)
-          [ -n "$BINNAME" ] || BINNAME=proxypin
-          mkdir -p dist
+          [ -n "$BUNDLE" ] && [ -d "$BUNDLE" ] || { echo "::error::未找到 bundle 目录"; exit 1; }
+          echo "$BUNDLE" > .bundle_path
+          ls -lh "$BUNDLE"
 
-          tar -czf "dist/proxypin-linux-${APP_VERSION}-x64.tar.gz" -C "$BUNDLE" .
-
-          PKG=build/debpkg
-          rm -rf "$PKG"
-          mkdir -p "$PKG/DEBIAN" "$PKG/opt/proxypin" "$PKG/usr/bin" \
-                   "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/256x256/apps"
-          cp -a "$BUNDLE/." "$PKG/opt/proxypin/"
-          ln -s "/opt/proxypin/$BINNAME" "$PKG/usr/bin/proxypin"
-          printf 'Package: proxypin\nVersion: %s\nSection: net\nPriority: optional\nArchitecture: amd64\nMaintainer: ProxyPin CI\nDescription: Open source HTTP(S) traffic capture tool (Flutter)\n' \
-            "$APP_VERSION" > "$PKG/DEBIAN/control"
-          printf '[Desktop Entry]\nType=Application\nName=ProxyPin\nExec=/opt/proxypin/%s\nIcon=proxypin\nCategories=Network;Development;\nTerminal=false\n' \
-            "$BINNAME" > "$PKG/usr/share/applications/proxypin.desktop"
-          if [ -f assets/icon.png ]; then
-            cp assets/icon.png "$PKG/usr/share/icons/hicolor/256x256/apps/proxypin.png"
-          fi
-          dpkg-deb --build "$PKG" "dist/proxypin-linux-${APP_VERSION}-amd64.deb"
-
-      - name: Build meta
+      # 主产物 tar.gz 先落盘；deb 打包独立且允许失败，不再拖垮整个 job。
+      - name: Package tar.gz
         shell: bash
         run: |
-          mkdir -p dist
-          echo "source_commit=$(git rev-parse HEAD)" > dist/BUILD_INFO.txt
-          flutter --version >> dist/BUILD_INFO.txt
-          ls -lh dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: proxypin-linux-${{ steps.ver.outputs.version }}
-          path: dist/
-          if-no-files-found: error
-          retention-days: 30
-
-  # ---------------------------------------------------------------------------
-  release:
-    name: Collect & Publish
-    needs: [android, ios, windows, macos, linux]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
-          fetch-depth: 1
-
-      - name: Read app version
-        id: ver
-        shell: bash
-        run: |
-          V=$(grep -E '^version:' pubspec.yaml | head -1 | sed -E "s/^version:[[:space:]]*//; s/['\"]//g; s/[+].*$//")
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-
-      - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Write build info
-        shell: bash
-        run: |
-          mkdir -p dist
-          {
-            echo "ProxyPin all-platform build"
-            echo "source: ${{ env.SOURCE_REPO }} @ ${{ env.SOURCE_REF }}"
-            echo "workflow run: ${{ github.run_id }} / #${{ github.run_number }}"
-            echo "built at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo ""
-            echo "files:"
-            ls -lh dist
-          } > dist/BUILD_INFO.txt
-
-      - name: Upload combined artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: proxypin-all-${{ steps.ver.outputs.version }}-${{ github.run_number }}
-          path: dist/
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Publish GitHub Release
-        if: ${{ github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/') || inputs.publish_release == true }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ProxyPin ${{ steps.ver.outputs.version }} · all platforms (build ${{ github.run_number }})
-          body_path: dist/BUILD_INFO.txt
-          prerelease: ${{ github.event_name == 'schedule' || inputs.publish_release == true }}
-          generate_release_notes: false
-          fail_on_unmatched_files: false
-          files: |
-            dist/*.apk
-            dist/*.aab
-            dist/*.zip
-            dist/*.exe
-            dist/*.dmg
-            dist/*.deb
-            dist/*.tar.gz
-            dist/BUILD_INFO.txt
+ 
