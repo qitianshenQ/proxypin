@@ -1,40 +1,30 @@
 # =============================================================================
-# ProxyPin 全平台自动构建 v6（Android 下载 404 修复 / 最终版）
+# ProxyPin 全平台自动构建 v7（新增按 ABI 拆分的 Android APK）
 #
 # 放到 fork 仓库：.github/workflows/build-all-platforms.yml
 #
-# 日志来源：logs_120998709300.zip（run 44702565569，Flutter 3.47.9 / v5）
-# v5 这次确实生效了（日志里有 >>> flutter ...、Gradle wrapper 已设置为 8.14.0、
-# android.newDsl=false），但第一条带跳过 flag 的命令报：
+# v6 已验证全平台构建成功。v7 在 Android 之外再产出按 CPU 架构拆分的 APK：
 #
-#   java.io.FileNotFoundException:
-#   https://github.com/gradle/gradle-distributions/releases/download/
-#           v8.14.0/gradle-8.14.0-all.zip
+#   proxypin-android-<ver>-arm64-v8a.apk    ARM64 / 64 位（现代真机）
+#   proxypin-android-<ver>-armeabi-v7a.apk  ARM32 / 32 位（老设备）
+#   proxypin-android-<ver>-x86_64.apk       x86  / 64 位（模拟器、Chromebook）
+#   proxypin-android-<ver>.apk              通用包（含全部受支持 ABI）
+#   proxypin-android-<ver>.aab              Play 商店包（Play 自动按 ABI 拆分）
 #
-# 结论（关键）：
-#  1. `--android-skip-build-dependency-validation` 已被 flutter 接受，
-#     日志里**没有** "minimum supported version of 8.14.0" 了 ——
-#     版本校验这一关已经绕过。
-#  2. Flutter 会把 wrapper 的 distributionUrl 重写到 GitHub 镜像，
-#     而 v5 把版本改成 8.14.0 后，该镜像里没有 8.14.0 的 all.zip -> 404。
-#     原版 8.11.1 在前几轮日志里是能正常下载并启动 Gradle 的（跑到插件校验
-#     阶段耗时 89s），证明它可下载。
-#  3. 所以「升级 wrapper」是帮倒忙：既不需要（flag 已绕过校验），
-#     又引入了下载不到的版本。
+# 关于 x86 32 位：Flutter 3.35 起把 Android x86 32 位标记为 deprecated，
+# 后续版本移除了 android-x86 engine；`--split-per-abi` 现在只产出上面 3 个
+# 包。workflow 会单独尝试 `--target-platform android-x86`，并且只有确认
+# APK 里真的含 lib/x86/libflutter.so 才发布；否则只打 notice，不造假包、
+# 不拖垮主构建。
 #
-# v6 修复：
-#  - 默认**保持项目原有 Gradle 8.11.1 不动**，只用官方跳过 flag 过校验。
-#  - gradle_version 输入默认留空；只有显式填写时才升级，且改用 -bin.zip
-#    （体积更小、镜像更可能收录）。同时备份原始 wrapper 供回退。
-#  - Build 多兜底：flag 不被识别 -> 原生命令；仍报最低版本 -> bin.zip 升级；
-#    下载 404 -> 恢复原始 wrapper 再带 flag 重试 / all 改 bin。
-#  - 每次尝试写独立日志文件，避免互相覆盖导致误判。
-#  - 修 Diagnostics 的 for 循环：原写法 `[ -f ] && {...}` 在文件缺失时
-#    会让整个诊断步骤自己 exit 1（日志末尾那条 "Process completed with
-#    exit code 1." 就是它，不是构建失败）。
-#  - 保留已验证有效的：Flutter 3.47.9、windows-2022 + coroutine 抑制宏、
-#    Linux -Werror 降级 + 合并打包、CI 签名、Action v5、
-#    Release 需五个平台全成功才发布。
+# 新增步骤沿用 v6 的跳过 flag / wrapper 备份回退逻辑；先落盘通用包再跑
+# 拆分构建，避免后续 Gradle 任务清理输出目录。Release 的 files 里已有
+# dist/*.apk，新增包会自动发布，无需改 Release 段。
+#
+# 保留 v6 全部修复：保持项目原有 Gradle 8.11.1 + 官方跳过 flag、
+# 404 恢复原始 wrapper、Diagnostics 不自曝 exit 1、Flutter 3.47.9、
+# windows-2022 + coroutine 抑制宏、Linux -Werror 降级 + 合并打包、
+# CI 签名、Action v5、Release 需五个平台全成功才发布。
 #
 # 默认 checkout 上游 wanghongenpin/proxypin 的 main；想编译自己 fork 的改动，
 # 手动运行时把 source_repo 改成你的仓库、ref 改分支。
@@ -292,21 +282,117 @@ jobs:
           build_target apk || exit 1
           build_target appbundle || exit 1
 
+      # === 按 ABI 拆分 APK ===
+      - name: Build per-ABI APKs
+        shell: bash
+        run: |
+          set -e
+          SKIP="--android-skip-build-dependency-validation"
+          W=android/gradle/wrapper/gradle-wrapper.properties
+          ORIG="$W.orig"
+          LOG=/tmp/proxypin_split.log
+          OUT=build/app/outputs/flutter-apk
+          mkdir -p dist
+
+          # 先把上一步的通用包 / AAB 落盘，防止后续 Gradle 任务清理输出目录
+          U=build/app/outputs/flutter-apk/app-release.apk
+          B=build/app/outputs/bundle/release/app-release.aab
+          if [ -f "$U" ]; then cp "$U" "dist/proxypin-android-${APP_VERSION}.apk"; fi
+          if [ -f "$B" ]; then cp "$B" "dist/proxypin-android-${APP_VERSION}.aab"; fi
+
+          try_split() {
+            echo ">>> flutter $*"
+            flutter "$@" 2>&1 | tee "$LOG"
+            return "${PIPESTATUS[0]}"
+          }
+          split_ok=false
+          if try_split build apk --release --split-per-abi "$SKIP"; then
+            split_ok=true
+          elif grep -qiE "Could not find an option named|Unknown option|unrecognized option|Unknown flag" "$LOG"; then
+            echo "::warning::跳过 flag 不被识别，改用原生命令"
+            if try_split build apk --release --split-per-abi; then split_ok=true; fi
+          fi
+          if [ "$split_ok" = false ] && grep -qiE "FileNotFoundException|downloading artifacts from the network|Could not GET|404" "$LOG" && [ -f "$ORIG" ]; then
+            echo "::warning::Gradle 分发包下载失败，恢复原始 wrapper 后重试"
+            cp "$ORIG" "$W"
+            if try_split build apk --release --split-per-abi "$SKIP"; then split_ok=true; fi
+          fi
+          if [ "$split_ok" = false ]; then
+            echo "::error::分架构 APK 构建失败"
+            tail -60 "$LOG" || true
+            exit 1
+          fi
+
+          # 三个受支持 ABI 立即改名落盘（放在 x86 尝试之前，避免被覆盖）
+          COUNT=0
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            SRC="$OUT/app-${ABI}-release.apk"
+            if [ ! -f "$SRC" ]; then
+              SRC=$(find build -type f -name "app-${ABI}-release.apk" | head -1)
+            fi
+            if [ -n "$SRC" ] && [ -f "$SRC" ]; then
+              cp "$SRC" "dist/proxypin-android-${APP_VERSION}-${ABI}.apk"
+              echo "::notice::$ABI -> proxypin-android-${APP_VERSION}-${ABI}.apk"
+              COUNT=$((COUNT+1))
+            else
+              echo "::warning::未生成 $ABI 分架构包"
+            fi
+          done
+          [ "$COUNT" -ge 1 ] || { echo "::error::一个分架构 APK 都没产出"; exit 1; }
+          if [ "$COUNT" -lt 3 ]; then echo "::warning::只产出 $COUNT/3 个分架构包"; fi
+
+          # x86 (32 位) 单独尝试：现代 Flutter 已移除 android-x86 engine。
+          # 失败只告警；即便命令返回 0，也必须校验 APK 内确有 32 位 x86 引擎。
+          X86LOG=/tmp/proxypin_x86.log
+          echo ">>> flutter build apk --release --split-per-abi --target-platform android-x86 $SKIP"
+          X86_OK=false
+          if flutter build apk --release --split-per-abi --target-platform android-x86 "$SKIP" 2>&1 | tee "$X86LOG"; then
+            X86SRC="$OUT/app-x86-release.apk"
+            if [ -f "$X86SRC" ] && unzip -l "$X86SRC" | grep -q 'lib/x86/libflutter.so'; then
+              cp "$X86SRC" "dist/proxypin-android-${APP_VERSION}-x86.apk"
+              echo "::notice::x86 (32 位) APK 已生成"
+              X86_OK=true
+            fi
+          fi
+          if [ "$X86_OK" = false ]; then
+            echo "::notice::x86 (32 位) 未发布：当前 Flutter 不再提供 android-x86 engine，官方仅支持 arm64-v8a / armeabi-v7a / x86_64"
+            grep -iE "x86|unsupported|not supported|invalid" "$X86LOG" | head -8 || true
+          fi
+
+          # ABI 对照表随 Artifact / Release 一起发布
+          {
+            echo "ProxyPin Android ABI 对照表 (${APP_VERSION})"
+            echo ""
+            echo "  proxypin-android-${APP_VERSION}-arm64-v8a.apk   = ARM64 (64 位)  绝大多数现代真机"
+            echo "  proxypin-android-${APP_VERSION}-armeabi-v7a.apk = ARM32 (32 位)  老设备"
+            echo "  proxypin-android-${APP_VERSION}-x86_64.apk      = x86 64 位       模拟器 / Chromebook"
+            echo "  proxypin-android-${APP_VERSION}.apk             = 通用包 (含全部受支持 ABI)"
+            echo "  proxypin-android-${APP_VERSION}.aab             = Play 商店包 (由 Play 按 ABI 自动拆分)"
+            if [ "$X86_OK" = true ]; then
+              echo "  proxypin-android-${APP_VERSION}-x86.apk         = x86 32 位 (本次 SDK 仍支持)"
+            else
+              echo "  x86 32 位: 本次未生成 —— Flutter 已移除 android-x86 engine"
+            fi
+          } > "dist/BUILD_INFO_android_abi.txt"
+          ls -lh dist
+
       - name: Collect artifacts
         shell: bash
         run: |
           set -e
           mkdir -p dist
-          APK=build/app/outputs/flutter-apk/app-release.apk
-          AAB=build/app/outputs/bundle/release/app-release.aab
-          [ -f "$APK" ] || APK=$(find build -type f -name '*.apk' | head -1)
-          [ -f "$AAB" ] || AAB=$(find build -type f -name '*.aab' | head -1)
-          [ -n "$APK" ] && [ -f "$APK" ] && cp "$APK" "dist/proxypin-android-${APP_VERSION}.apk"
-          [ -n "$AAB" ] && [ -f "$AAB" ] && cp "$AAB" "dist/proxypin-android-${APP_VERSION}.aab"
+          U=build/app/outputs/flutter-apk/app-release.apk
+          B=build/app/outputs/bundle/release/app-release.aab
+          # 不再用 find 兜底，避免把某个分架构包误命名成通用包
+          if [ -f "$U" ]; then cp "$U" "dist/proxypin-android-${APP_VERSION}.apk"; fi
+          if [ -f "$B" ]; then cp "$B" "dist/proxypin-android-${APP_VERSION}.aab"; fi
           echo "source_commit=$(git rev-parse HEAD)" > "dist/BUILD_INFO_android.txt"
           flutter --version >> "dist/BUILD_INFO_android.txt"
           ls -lh dist
-          [ -f "dist/proxypin-android-${APP_VERSION}.apk" ] || { echo "::error::未找到 APK"; exit 1; }
+          if ! ls dist/*.apk >/dev/null 2>&1; then
+            echo "::error::未找到任何 APK"
+            exit 1
+          fi
 
       - name: Diagnostics on failure
         if: failure()
