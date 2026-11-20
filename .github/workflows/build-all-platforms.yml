@@ -1,41 +1,37 @@
 # =============================================================================
-# ProxyPin 全平台自动构建 v3（按真实 CI 日志修复）
+# ProxyPin 全平台自动构建 v4（按第二轮真实 CI 日志修复）
 #
 # 放到 fork 仓库：.github/workflows/build-all-platforms.yml
 #
-# 日志来源：logs_120964094780.zip（run #1，Flutter 3.50.1 + ubuntu-26.04 /
-# windows-latest(VS18/MSVC14.51)）。iOS / macOS 成功，三个平台挂在同一层：
+# 日志来源：logs_120986769957.zip（run 44698021950，Flutter 3.47.9 / actions@v5）
+# 结论：Windows / Linux / macOS / iOS 四个平台全部构建成功并上传产物；
+#       仅 Android 仍 exit 1。
 #
-#  [Android] FAILURE: Your project's Gradle version (8.11.1) is lower than
-#            Flutter's minimum supported version of 9.3.1
-#            -> 3.50 新增的 flutter-gradle-plugin 校验；官方提供
-#               --android-skip-build-dependency-validation 绕过。
-#  [Windows] error C2338: <experimental/coroutine> deprecated by MSVC 14.51
-#            (permission_handler_windows)，另有
-#            Get-Item : Could not find item C:\Users\runneradmin\AppData
-#  [Linux]   error: 'app_indicator_new' is deprecated [-Werror,-Wdeprecated-declarations]
-#            (tray_manager)，Flutter Linux 模板的 -Werror 把新 clang 的
-#            deprecated 警告提升为硬错误。
+# [Android 唯一失败点]
+#   Error: Your project's Gradle version (8.11.1) is lower than Flutter's
+#          minimum supported version of 8.14.0. Please upgrade ...
+#          Alternatively, use the flag "--android-skip-build-dependency-validation".
+#   注意：3.47.9 也做这个校验（阈值 8.14.0），不只是 3.50.1（阈值 9.3.1）。
+#   v3 用 `flutter build apk --help | grep` 探测该 flag —— 它是隐藏选项，
+#   --help 里根本没有，导致 ANDROID_SKIP_FLAG 为空，绕过 flag 没加上。
 #
-# v3 主修复：
-#  1. 默认 Flutter 固定到 3.47.9（项目 v1.4.0 / 2026-10-29 发布时的 stable，
-#     Dart 3.13.7），避开刚发布 3.50.1 的破坏性校验；inputs 可手动覆盖。
-#  2. Android：自动探测并按需追加 --android-skip-build-dependency-validation，
-#     即使手动填 3.50+ 也能构建；保留 CI 签名 / 关闭 R8 / 确定产物路径。
-#  3. Windows：runner 换 windows-2022（VS2022 / MSVC14.3x 不会把
-#     experimental/coroutine 报成 C2338），双保险注入官方抑制宏
-#     _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS 到 CMake；
-#     预创建 AppData\Local\Pub\Cache 消除 cargokit resolve_symlinks.ps1 报错。
-#  4. Linux：把仓库与插件 CMakeLists 里的 -Werror 替换为
-#     -Wno-error=deprecated-declarations，并给 tray_manager 源码加 pragma。
-#  5. Release：五个平台全部成功才发版，避免再发「只有 iOS/macOS」的残缺包。
-#  6. 保留 v2 的通用加固：pub get 重试、gen-l10n 非致命、bsdtar/Inno Setup
-#     降级、DEB 允许失败、Action 升 v5、failure() 诊断日志。
+# v4 修复：
+#  1. 删掉 --help 探测，构建时**无条件先带** --android-skip-build-dependency-validation；
+#     若当前 Flutter 不认识该选项，自动回退原生命令。
+#  2. 若仍报 Gradle 版本过低，从报错里正则提取最低版本，自动改写
+#     android/gradle/wrapper/gradle-wrapper.properties 的 distributionUrl 后重试。
+#  3. 顺手 opt-out `android.newDsl`（日志里 Flutter Fix 的 AGP 9+ 提示）。
+#  4. Linux 打包阶段第二轮出现「空 run 步骤 + 后续步骤全部消失」的异常：
+#     把 Linux compatibility patches 的 Python heredoc 改成纯 bash（避免粘贴/解析
+#     损坏），并把 Build Linux / tar.gz / DEB / Build meta 合并成一个步骤，
+#     去掉跨步骤 .bundle_path 依赖，保证产物一定落盘。
+#  5. 保留 v3 已验证有效的部分：Flutter 固定 3.47.9、windows-2022 +
+#     coroutine 抑制宏、Linux -Werror 降级、CI 签名、Action v5、
+#     Release 需五个平台全成功才发布。
 #
-# 默认 checkout 上游 wanghongenpin/proxypin 的 main，保证「最新源码」；
-# 想编译自己 fork 的改动，手动运行时把 source_repo 改成你的仓库、ref 改分支。
-#
-# 发布 Release 需：Settings -> Actions -> General -> Workflow permissions
+# 默认 checkout 上游 wanghongenpin/proxypin 的 main；想编译自己 fork 的改动，
+# 手动运行时把 source_repo 改成你的仓库、ref 改分支。
+# 发布 Release 需 Settings -> Actions -> General -> Workflow permissions
 #   -> Read and write permissions（本文件已声明 permissions: contents: write）。
 # =============================================================================
 
@@ -53,7 +49,7 @@ on:
         required: false
         default: ''
       flutter_version:
-        description: 'Flutter 版本；默认 3.47.9（项目 1.4.0 适配版），填 stable 用最新'
+        description: 'Flutter 版本；默认 3.47.9（v1.4.0 适配版）；填 stable = 最新 stable'
         required: false
         default: '3.47.9'
       publish_release:
@@ -85,9 +81,9 @@ concurrency:
 env:
   SOURCE_REPO: ${{ inputs.source_repo || 'wanghongenpin/proxypin' }}
   SOURCE_REF: ${{ inputs.ref || github.ref_name }}
-  # 非 workflow_dispatch（tag / schedule）时 inputs 为空，必须在这里兜底，
-  # 固定到项目适配版本，避免刚发布的新 stable 引入破坏性校验。
-  FLUTTER_VERSION: ${{ inputs.flutter_version || '3.47.9' }}
+  # 默认固定 3.47.9；手动填 stable 映射为空，由 flutter-action 按 channel 拉最新；
+  # tag / schedule 等非 dispatch 事件 inputs 为空，也会走 3.47.9 兜底。
+  FLUTTER_VERSION: ${{ (inputs.flutter_version == '' && '3.47.9') || (inputs.flutter_version == 'stable' && '') || inputs.flutter_version }}
   RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('build-{0}', github.run_number) }}
 
 jobs:
@@ -130,7 +126,6 @@ jobs:
 
       # 项目 android/app/build.gradle 的 release/debug 都绑 signingConfigs.release，
       # 且强制读 android/key.properties；CI 缺文件 -> validateSigningRelease 直接失败。
-      # 四个 secrets 必须齐全才用正式密钥，否则生成临时 CI 密钥（仅自测分发）。
       - name: Prepare Android signing
         shell: bash
         env:
@@ -152,23 +147,22 @@ jobs:
             STORE_PASSWORD=proxypin-ci
             KEY_PASSWORD=proxypin-ci
             KEY_ALIAS=proxypin-ci
-            echo "::notice::未配置 ANDROID_* secrets，使用临时 CI 密钥；正式分发请配置 keystore"
+            echo "::notice::未配置 ANDROID_* secrets，使用临时 CI 密钥"
           fi
-          # Gradle 的 file() 相对 android/app 解析，../release.jks => android/release.jks
           printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=../release.jks\n' \
             "$STORE_PASSWORD" "$KEY_PASSWORD" "$KEY_ALIAS" > android/key.properties
-          cat android/key.properties | sed 's/storePassword=.*/storePassword=***/; s/keyPassword=.*/keyPassword=***/'
 
-      # 项目默认开启 R8（minifyEnabled/shrinkResources），CI 里常因缺 keep rules
-      # 直接构建失败。关闭混淆不影响功能，只增大体积；需要混淆可删掉本步骤。
-      - name: Disable R8 for CI
+      - name: Disable R8 & opt-out AGP newDsl for CI
         shell: bash
         run: |
           F=android/app/build.gradle
           if [ -f "$F" ]; then
             sed -i 's/minifyEnabled true/minifyEnabled false/g; s/shrinkResources true/shrinkResources false/g' "$F"
-            echo "::notice::已关闭 minifyEnabled / shrinkResources"
           fi
+          if [ -f android/gradle.properties ] && ! grep -q 'android.newDsl' android/gradle.properties; then
+            printf '\nandroid.newDsl=false\n' >> android/gradle.properties
+          fi
+          echo "::notice::已关闭 R8 并 opt-out android.newDsl"
 
       - uses: subosito/flutter-action@v2
         with:
@@ -194,49 +188,53 @@ jobs:
           fi
           flutter doctor -v || true
 
-      - name: Android compatibility patch
-        shell: bash
-        run: |
-          set -e
-          # Flutter 3.50+ 新增「Gradle 最低 9.3.1」校验，项目 wrapper 是 8.11.1，
-          # 日志实测 assembleRelease 会被 dev.flutter.flutter-gradle-plugin 直接拒绝。
-          # 官方绕过 flag 只在 3.50+ 存在，老 SDK 不认识，所以先探测再决定是否追加。
-          FLAG=""
-          if flutter build apk --help 2>&1 | grep -q -- '--android-skip-build-dependency-validation'; then
-            FLAG="--android-skip-build-dependency-validation"
-            echo "::notice::检测到 Gradle 版本校验，构建自动追加 $FLAG"
-          else
-            echo "::notice::当前 Flutter 无 Gradle 版本校验，按原样构建"
-          fi
-          echo "ANDROID_SKIP_FLAG=$FLAG" >> "$GITHUB_ENV"
-
+      # 核心修复：不再用 --help 探测（该 flag 是隐藏选项，探测必然失败）。
+      # 1) 先无条件带绕过 flag；2) 不认识就回退原生命令；
+      # 3) 仍报 Gradle 版本过低则从报错提取最低版本，自动改 wrapper 再试。
       - name: Build APK & AAB
         shell: bash
         run: |
           set -e
-          # 3.50+ 下若绕过 flag 不被某个子命令接受，退回原生命令再试一次
-          if ! flutter build apk --release $ANDROID_SKIP_FLAG; then
-            if [ -n "$ANDROID_SKIP_FLAG" ]; then
-              echo "::warning::带 Gradle 校验绕过 flag 的 APK 构建失败，尝试原生命令"
-              flutter build apk --release || {
-                echo "::error::APK 构建失败"
-                find build -name '*.log' -o -name '*.txt' 2>/dev/null | head -20 | xargs -r tail -60
-                exit 1
-              }
-            else
-              echo "::error::APK 构建失败"
-              exit 1
+          SKIP="--android-skip-build-dependency-validation"
+          WRAPPER=android/gradle/wrapper/gradle-wrapper.properties
+          run_flutter() {
+            local log="$1"; shift
+            echo ">>> flutter $*"
+            flutter "$@" 2>&1 | tee "$log"
+            return "${PIPESTATUS[0]}"
+          }
+          build_target() {
+            local sub="$1" log="/tmp/proxypin_${sub}.log"
+            local args=(build "$sub" --release "$SKIP")
+            if run_flutter "$log" "${args[@]}"; then return 0; fi
+
+            # 情形 A：当前 Flutter 不认识这个隐藏 flag（老 SDK），回退原生命令
+            if grep -qiE "Could not find an option named|Unknown option|unrecognized option|not a known option|Unknown flag" "$log"; then
+              echo "::warning::$SKIP 不被当前 Flutter 识别，回退原生命令"
+              args=(build "$sub" --release)
+              if run_flutter "$log" "${args[@]}"; then return 0; fi
             fi
-          fi
-          if ! flutter build appbundle --release $ANDROID_SKIP_FLAG; then
-            if [ -n "$ANDROID_SKIP_FLAG" ]; then
-              echo "::warning::带 Gradle 校验绕过 flag 的 AAB 构建失败，尝试原生命令"
-              flutter build appbundle --release || { echo "::error::AAB 构建失败"; exit 1; }
-            else
-              echo "::error::AAB 构建失败"
-              exit 1
+
+            # 情形 B：最新日志仍报 Gradle 版本过低 -> 从报错提取最低版本，
+            # 自动改写 wrapper 的 distributionUrl 后再试（官方 Potential fix）
+            if grep -q "minimum supported version of" "$log"; then
+              # 报错行同时含「项目当前版本」和「最低要求版本」，只取 of 之后那个；
+              # 结尾要求数字，避免把句尾的点号吃进版本号。
+              MIN=$(sed -n 's/.*minimum supported version of \([0-9][0-9.]*[0-9]\).*/\1/p' "$log" | head -1)
+              if [ -n "$MIN" ] && [ -f "$WRAPPER" ]; then
+                echo "::warning::自动把 Gradle wrapper 升级到 $MIN 后重试"
+                sed -i -E "s#gradle-[0-9][0-9.]*-(bin|all)\.zip#gradle-${MIN}-\1.zip#" "$WRAPPER"
+                grep distributionUrl "$WRAPPER" || true
+                if run_flutter "$log" "${args[@]}"; then return 0; fi
+              fi
             fi
-          fi
+
+            echo "::error::$sub 构建失败，日志尾部："
+            tail -60 "$log"
+            return 1
+          }
+          build_target apk || exit 1
+          build_target appbundle || exit 1
 
       - name: Collect artifacts
         shell: bash
@@ -260,10 +258,12 @@ jobs:
         run: |
           echo "===== flutter doctor ====="
           flutter doctor -v || true
-          echo "===== pubspec git deps ====="
-          grep -nE 'git:|ref:|url:' pubspec.yaml || true
-          echo "===== gradle logs ====="
-          find . -path '*/build/*' -name '*.log' 2>/dev/null | head -20 | xargs -r tail -80
+          echo "===== gradle wrapper ====="
+          cat android/gradle/wrapper/gradle-wrapper.properties || true
+          echo "===== build logs ====="
+          for f in /tmp/proxypin_apk.log /tmp/proxypin_appbundle.log; do
+            [ -f "$f" ] && { echo "--- $f"; tail -60 "$f"; }
+          done
 
       - uses: actions/upload-artifact@v5
         with:
@@ -437,19 +437,21 @@ jobs:
           $cmake = 'windows/CMakeLists.txt'
           $text = Get-Content -Path $cmake -Raw
           if ($text -notmatch '_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS') {
-            $insert = "add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)"
-            $patterns = @('(?m)^(project\([^\r\n]*\)\s*)$', '(?m)^(cmake_minimum_required\([^\r\n]*\)\s*)$')
-            $patched = $text
-            foreach ($pat in $patterns) {
-              if ($patched -match $pat) {
-                $rx = [regex]::new($pat)
-                $patched = $rx.Replace($patched, "`$0`n$insert", 1)
-                break
-              }
+            $insert = 'add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)'
+            # 逐行插入，不用正则：固定放在 cmake_minimum_required 之后，
+            # add_definitions 才会对后面 add_subdirectory 里的插件 target 生效。
+            $lines = @($text -split "`r?`n")
+            $at = 0
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^\s*cmake_minimum_required\s*\(') { $at = $i + 1; break }
             }
-            if ($patched -eq $text) { $patched = $text + "`n$insert`n" }
-            Set-Content -Path $cmake -Value $patched -Encoding utf8NoBOM
-            Write-Host "::notice::已注入 _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
+            $before = @()
+            if ($at -gt 0) { $before = @($lines[0..($at - 1)]) }
+            $after = @()
+            if ($at -lt $lines.Count) { $after = @($lines[$at..($lines.Count - 1)]) }
+            $out = @($before) + @($insert) + @($after)
+            Set-Content -Path $cmake -Value ($out -join "`n") -Encoding utf8NoBOM
+            Write-Host "::notice::已在 windows/CMakeLists.txt 第 $($at + 1) 行注入 coroutine 抑制宏"
           }
 
           # 3) 额外通过 CL 环境变量兜底（cl.exe 会读取），三保险
@@ -687,68 +689,162 @@ jobs:
           if [ -f l10n.yaml ]; then flutter gen-l10n || echo "::warning::gen-l10n 失败，忽略"; fi
           flutter doctor -v || true
 
+      # Ubuntu 26.04 的 clang 把 app_indicator_new 标为 deprecated，Flutter Linux
+      # 模板的 -Werror 会把它升级成硬错误。纯 bash 处理（不用 heredoc，避免
+      # workflow 复制/解析时被破坏），显式跟随插件 symlink 目录。
       - name: Linux compatibility patches
         shell: bash
         run: |
           set -e
-          python3 - <<'PY'
-          import pathlib, re
-          # Ubuntu 26.04 的 clang 把 app_indicator_new 标记为 deprecated，
-          # Flutter Linux 模板的 -Werror 把它升级成硬错误（日志中的失败点）。
-          # 仓库文件 + pub get 生成的插件 symlink 一起处理，其他警告仍保留 -Wall。
-          changed = 0
-          seen = set()
-          targets = list(pathlib.Path('linux').rglob('CMakeLists.txt'))
-          sym_root = pathlib.Path('linux/flutter/ephemeral/.plugin_symlinks')
-          if sym_root.exists():
-              for link in sym_root.iterdir():
-                  if link.is_dir():
-                      targets.extend(link.rglob('CMakeLists.txt'))
-          for f in targets:
-              try:
-                  rp = f.resolve()
-                  if rp in seen:
-                      continue
-                  seen.add(rp)
-                  t = f.read_text(errors='ignore')
-                  t2 = re.sub(r'-Werror(?![\w=])', '-Wno-error=deprecated-declarations', t)
-                  if t2 != t:
-                      f.write_text(t2)
-                      changed += 1
-                      print('patched cmake:', f)
-              except Exception as e:
-                  print('skip cmake:', f, e)
-          # 双保险：tray_manager 源码直接加 pragma，插件若自带 -Werror 也不怕
-          sym = pathlib.Path('linux/flutter/ephemeral/.plugin_symlinks/tray_manager/linux')
-          if sym.exists():
-              for f in sym.rglob('*.cc'):
-                  try:
-                      t = f.read_text(errors='ignore')
-                      if '_SILENCE_DEPRECATED' not in t:
-                          f.write_text('#pragma GCC diagnostic ignored "-Wdeprecated-declarations"\n// _SILENCE_DEPRECATED\n' + t)
-                          print('pragma:', f)
-                  except Exception as e:
-                      print('skip cc:', f, e)
-          print('CMakeLists patched:', changed)
-          PY
+          FILES="$( { find linux -type f -name CMakeLists.txt 2>/dev/null || true; \
+                     find -L linux/flutter/ephemeral/.plugin_symlinks -type f -name CMakeLists.txt 2>/dev/null || true; } | sort -u )"
+          N=0
+          for f in $FILES; do
+            sed -i -E 's/-Werror($|[^[:alnum:]_=])/-Wno-error=deprecated-declarations\1/g' "$f" 2>/dev/null || true
+            N=$((N+1))
+          done
+          echo "::notice::已处理 CMakeLists: $N"
+          TRAY=linux/flutter/ephemeral/.plugin_symlinks/tray_manager/linux/tray_manager_plugin.cc
+          if [ -f "$TRAY" ] && ! grep -q '_SILENCE_DEPRECATED' "$TRAY"; then
+            sed -i '1i #pragma GCC diagnostic ignored "-Wdeprecated-declarations"' "$TRAY"
+            sed -i '2i // _SILENCE_DEPRECATED' "$TRAY"
+            echo "::notice::已给 tray_manager 注入 pragma"
+          fi
 
-      - name: Build Linux
+      # 合并成一个步骤：构建 + tar.gz + DEB + 元信息一次做完，避免第二轮日志里
+      # 「Package tar.gz 变成空 run、后续步骤整体消失」导致 Linux 产物没上传。
+      - name: Build + package Linux
         shell: bash
         run: |
           set -e
-          flutter build linux --release || {
-            echo "::error::Linux 构建失败"
-            find build/linux -name '*.log' 2>/dev/null | head -10 | xargs -r tail -80
-            exit 1
-          }
+          flutter build linux --release || { echo "::error::Linux 构建失败"; exit 1; }
           BUNDLE=build/linux/x64/release/bundle
           [ -d "$BUNDLE" ] || BUNDLE=$(find build/linux -type d -name bundle | head -1)
           [ -n "$BUNDLE" ] && [ -d "$BUNDLE" ] || { echo "::error::未找到 bundle 目录"; exit 1; }
-          echo "$BUNDLE" > .bundle_path
-          ls -lh "$BUNDLE"
+          mkdir -p dist
+          tar -czf "dist/proxypin-linux-${APP_VERSION}-x64.tar.gz" -C "$BUNDLE" .
+          echo "::notice::tar.gz 完成"
 
-      # 主产物 tar.gz 先落盘；deb 打包独立且允许失败，不再拖垮整个 job。
-      - name: Package tar.gz
+          if BIN=$(find "$BUNDLE" -maxdepth 1 -type f -executable | head -1) && [ -n "$BIN" ]; then
+            BINNAME=$(basename "$BIN")
+            PKG=build/debpkg
+            rm -rf "$PKG"
+            mkdir -p "$PKG/DEBIAN" "$PKG/opt/proxypin" "$PKG/usr/bin" \
+                     "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/256x256/apps"
+            cp -a "$BUNDLE/." "$PKG/opt/proxypin/"
+            ln -sf "/opt/proxypin/$BINNAME" "$PKG/usr/bin/proxypin"
+            printf 'Package: proxypin\nVersion: %s\nSection: net\nPriority: optional\nArchitecture: amd64\nMaintainer: ProxyPin CI\nDescription: Open source HTTP(S) traffic capture tool (Flutter)\n' \
+              "$APP_VERSION" > "$PKG/DEBIAN/control"
+            printf '[Desktop Entry]\nType=Application\nName=ProxyPin\nExec=/opt/proxypin/%s\nIcon=proxypin\nCategories=Network;Development;\nTerminal=false\n' \
+              "$BINNAME" > "$PKG/usr/share/applications/proxypin.desktop"
+            if [ -f assets/icon.png ]; then
+              cp assets/icon.png "$PKG/usr/share/icons/hicolor/256x256/apps/proxypin.png"
+            fi
+            if dpkg-deb --build "$PKG" "dist/proxypin-linux-${APP_VERSION}-amd64.deb"; then
+              echo "::notice::DEB 完成"
+            else
+              echo "::warning::DEB 打包失败，tar.gz 仍可用"
+            fi
+          else
+            echo "::warning::未找到可执行文件，跳过 DEB"
+          fi
+
+          echo "source_commit=$(git rev-parse HEAD)" > "dist/BUILD_INFO_linux.txt"
+          flutter --version >> "dist/BUILD_INFO_linux.txt"
+          ls -lh dist
+          [ -f "dist/proxypin-linux-${APP_VERSION}-x64.tar.gz" ] || { echo "::error::tar.gz 缺失"; exit 1; }
+
+      - name: Diagnostics on failure
+        if: failure()
         shell: bash
         run: |
- 
+          echo "===== flutter doctor ====="
+          flutter doctor -v || true
+          echo "===== pkg-config ====="
+          pkg-config --exists gtk+-3.0 && echo "gtk+-3.0 OK" || echo "gtk+-3.0 MISSING"
+          echo "===== dist ====="
+          ls -lh dist 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: proxypin-linux-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ===========================================================================
+  release:
+    name: Collect & Publish
+    needs: [android, ios, windows, macos, linux]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 1
+
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          V=$(grep -E '^version:' pubspec.yaml | head -1 | cut -d: -f2- | tr -d " '\"\r" | cut -d+ -f1)
+          [ -n "$V" ] || V=0.0.0
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write build info
+        shell: bash
+        run: |
+          mkdir -p dist
+          {
+            echo "ProxyPin all-platform build"
+            echo "source: ${{ env.SOURCE_REPO }} @ ${{ env.SOURCE_REF }}"
+            echo "workflow run: ${{ github.run_id }} / #${{ github.run_number }}"
+            echo "built at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "files:"
+            ls -lh dist
+          } > dist/BUILD_INFO.txt
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: proxypin-all-${{ steps.ver.outputs.version }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Warn on partial build
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        shell: bash
+        run: echo "::warning::部分平台构建失败，跳过 Release 发布，仅上传合并 Artifact"
+
+      - name: Publish GitHub Release
+        # 五个平台必须全部成功才发版，避免再发「只有 iOS/macOS」的残缺 Release
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && (github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/') || inputs.publish_release == true) }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ProxyPin ${{ steps.ver.outputs.version }} · all platforms (build ${{ github.run_number }})
+          body_path: dist/BUILD_INFO.txt
+          prerelease: ${{ github.event_name == 'schedule' || inputs.publish_release == true }}
+          generate_release_notes: false
+          fail_on_unmatched_files: false
+          files: |
+            dist/*.apk
+            dist/*.aab
+            dist/*.ipa
+            dist/*.zip
+            dist/*.exe
+            dist/*.dmg
+            dist/*.deb
+            dist/*.tar.gz
+            dist/BUILD_INFO*.txt
