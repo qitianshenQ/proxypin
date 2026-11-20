@@ -1,35 +1,40 @@
 # =============================================================================
-# ProxyPin 全平台自动构建 v5（Android 确定性修复）
+# ProxyPin 全平台自动构建 v6（Android 下载 404 修复 / 最终版）
 #
 # 放到 fork 仓库：.github/workflows/build-all-platforms.yml
 #
-# 已确认：Windows / Linux / macOS / iOS 四个平台均构建成功并上传产物，
-#         唯一红的是 Android，且报错稳定复现：
-#   Error: Your project's Gradle version (8.11.1) is lower than Flutter's
-#          minimum supported version of 8.14.0.
-#          Alternatively, use the flag "--android-skip-build-dependency-validation".
-#   + Flutter Fix: Starting AGP 9+, only the new DSL interface will be read
-#     -> opt out of `android.newDsl`.
+# 日志来源：logs_120998709300.zip（run 44702565569，Flutter 3.47.9 / v5）
+# v5 这次确实生效了（日志里有 >>> flutter ...、Gradle wrapper 已设置为 8.14.0、
+# android.newDsl=false），但第一条带跳过 flag 的命令报：
 #
-# 为什么 v3/v4 没解决：
-#  - v3 用 `flutter build apk --help | grep` 探测绕过 flag，但它是隐藏选项，
-#    --help 不列出，探测必然为空 -> flag 没加上。
-#  - v4 改成无条件带 flag + 失败后兜底，但贴回来的日志里既没有
-#    `>>> flutter ... --android-skip-build-dependency-validation`，
-#    失败文案也是旧版的「APK 构建失败」—— 说明那次跑到的仍是旧构建段。
-#    而且「失败后再改 wrapper」要多跑一遍 Gradle，慢且依赖错误文本。
+#   java.io.FileNotFoundException:
+#   https://github.com/gradle/gradle-distributions/releases/download/
+#           v8.14.0/gradle-8.14.0-all.zip
 #
-# v5 的原则：**不依赖任何 CLI 探测 / 隐藏 flag，构建前就把环境改对**。
-#  1. 新增 gradle_version 输入（默认 8.14.0，正好等于报错要求）。
-#  2. 新增 `Android Gradle compatibility` 步骤，在 flutter build 之前主动把
-#     android/gradle/wrapper/gradle-wrapper.properties 的 distributionUrl
-#     升到目标版本（官方 Potential fix 就是这么写的），并强制覆盖
-#     android.newDsl=false（先删已有行再写，避免 true 残留）。
-#  3. Build 阶段保留三层：带跳过 flag 最快 -> 不带 flag 用已升级 wrapper
-#     重试 -> 若仍提示更高最低版本则动态升级 wrapper 再试。
-#  4. 保留已验证有效的：Flutter 3.47.9、windows-2022 + coroutine 抑制宏、
-#     Linux -Werror 降级 + 合并打包、CI 签名、Action v5、
-#     Release 需五个平台全成功才发布。
+# 结论（关键）：
+#  1. `--android-skip-build-dependency-validation` 已被 flutter 接受，
+#     日志里**没有** "minimum supported version of 8.14.0" 了 ——
+#     版本校验这一关已经绕过。
+#  2. Flutter 会把 wrapper 的 distributionUrl 重写到 GitHub 镜像，
+#     而 v5 把版本改成 8.14.0 后，该镜像里没有 8.14.0 的 all.zip -> 404。
+#     原版 8.11.1 在前几轮日志里是能正常下载并启动 Gradle 的（跑到插件校验
+#     阶段耗时 89s），证明它可下载。
+#  3. 所以「升级 wrapper」是帮倒忙：既不需要（flag 已绕过校验），
+#     又引入了下载不到的版本。
+#
+# v6 修复：
+#  - 默认**保持项目原有 Gradle 8.11.1 不动**，只用官方跳过 flag 过校验。
+#  - gradle_version 输入默认留空；只有显式填写时才升级，且改用 -bin.zip
+#    （体积更小、镜像更可能收录）。同时备份原始 wrapper 供回退。
+#  - Build 多兜底：flag 不被识别 -> 原生命令；仍报最低版本 -> bin.zip 升级；
+#    下载 404 -> 恢复原始 wrapper 再带 flag 重试 / all 改 bin。
+#  - 每次尝试写独立日志文件，避免互相覆盖导致误判。
+#  - 修 Diagnostics 的 for 循环：原写法 `[ -f ] && {...}` 在文件缺失时
+#    会让整个诊断步骤自己 exit 1（日志末尾那条 "Process completed with
+#    exit code 1." 就是它，不是构建失败）。
+#  - 保留已验证有效的：Flutter 3.47.9、windows-2022 + coroutine 抑制宏、
+#    Linux -Werror 降级 + 合并打包、CI 签名、Action v5、
+#    Release 需五个平台全成功才发布。
 #
 # 默认 checkout 上游 wanghongenpin/proxypin 的 main；想编译自己 fork 的改动，
 # 手动运行时把 source_repo 改成你的仓库、ref 改分支。
@@ -55,9 +60,9 @@ on:
         required: false
         default: '3.47.9'
       gradle_version:
-        description: 'Gradle wrapper 版本；默认 8.14.0（Flutter 3.47.9 的最低要求）'
+        description: '留空 = 保持项目原版 8.11.1（推荐，配合跳过 flag）；仅校验无法绕过时再填版本号'
         required: false
-        default: '8.14.0'
+        default: ''
       publish_release:
         description: '是否额外发布到 GitHub Release（push v* tag 与定时任务会自动发布）'
         type: boolean
@@ -90,8 +95,8 @@ env:
   # 默认固定 3.47.9；手动填 stable 映射为空，由 flutter-action 按 channel 拉最新；
   # tag / schedule 等非 dispatch 事件 inputs 为空，也会走 3.47.9 兜底。
   FLUTTER_VERSION: ${{ (inputs.flutter_version == '' && '3.47.9') || (inputs.flutter_version == 'stable' && '') || inputs.flutter_version }}
-  # tag / schedule 事件 inputs 为空，同样走 8.14.0 兜底
-  GRADLE_VERSION: ${{ inputs.gradle_version || '8.14.0' }}
+  # 留空 = 不改 wrapper；tag / schedule 事件同样为空，行为一致
+  GRADLE_VERSION: ${{ inputs.gradle_version }}
   RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('build-{0}', github.run_number) }}
 
 jobs:
@@ -193,22 +198,27 @@ jobs:
           fi
           flutter doctor -v || true
 
-      # === 确定性主修复：构建前就把 Gradle 环境改对，不依赖任何隐藏 flag ===
-      # 报错里的官方 Potential fix 就是改 gradle-wrapper.properties 的
-      # distributionUrl；3.47.9 要求 >= 8.14.0，项目自带 8.11.1。
-      # 同时强制 opt-out android.newDsl（Flutter Fix 的 AGP 9+ 提示）。
+      # === 主修复：保持项目原有 Gradle 8.11.1，只靠官方 flag 绕过版本校验 ===
+      # v5 教训：把 wrapper 升到 8.14.0 后，Flutter 重写的 GitHub 镜像里没有
+      # 该版本的 all.zip（FileNotFoundException）；而 8.11.1 已验证可下载。
       - name: Android Gradle compatibility
         shell: bash
         run: |
           set -e
           W=android/gradle/wrapper/gradle-wrapper.properties
-          GV="${GRADLE_VERSION:-8.14.0}"
+          GV="${GRADLE_VERSION:-}"
           if [ -f "$W" ]; then
-            sed -i -E "s#gradle-[0-9][0-9.]*-(bin|all)\.zip#gradle-${GV}-\1.zip#" "$W"
-            echo "::notice::Gradle wrapper 已设置为 $GV"
+            cp "$W" "$W.orig"          # 备份，供下载失败时回退
+            if [ -n "$GV" ]; then
+              # 显式指定版本时一律用 -bin.zip，避免 all.zip 在镜像缺失
+              sed -i -E "s#gradle-[0-9][0-9.]*-(bin|all)\.zip#gradle-${GV}-bin.zip#" "$W"
+              echo "::notice::按输入把 wrapper 设为 gradle-${GV}-bin.zip"
+            else
+              echo "::notice::保持项目原有 Gradle wrapper（配合跳过 flag 绕过版本校验）"
+            fi
             grep distributionUrl "$W" || true
           else
-            echo "::warning::未找到 $W，跳过 wrapper 调整（将依赖跳过 flag）"
+            echo "::warning::未找到 $W，跳过 wrapper 处理"
           fi
           P=android/gradle.properties
           touch "$P"
@@ -216,15 +226,15 @@ jobs:
           printf '\nandroid.newDsl=false\n' >> "$P"
           echo "::notice::已强制写入 android.newDsl=false"
 
-      # 构建三层兜底：带跳过 flag（最快） -> 原生命令（wrapper 已升级，
-      # 即使隐藏 flag 不存在也能过） -> 按报错动态升更高版本再试。
-      # 每条命令都打 `>>>` 前缀，日志里一眼能确认新版脚本是否生效。
+      # 主路径：原版 wrapper + 官方跳过 flag（v5 日志已证明 flag 能过校验）。
+      # 每次尝试写独立日志，避免互相覆盖；每条命令打 >>> 前缀便于核对。
       - name: Build APK & AAB
         shell: bash
         run: |
           set -e
           SKIP="--android-skip-build-dependency-validation"
           W=android/gradle/wrapper/gradle-wrapper.properties
+          ORIG="$W.orig"
           run_flutter() {
             local log="$1"; shift
             echo ">>> flutter $*"
@@ -232,27 +242,51 @@ jobs:
             return "${PIPESTATUS[0]}"
           }
           build_target() {
-            local sub="$1" log="/tmp/proxypin_${sub}.log"
+            local sub="$1" base="/tmp/proxypin_${sub}" n=0 log=""
+            local MIN=""
 
+            # 第 1 次：带跳过 flag（已验证 flutter 接受且能绕过 Gradle 校验）
+            n=$((n+1)); log="${base}_${n}.log"
             if run_flutter "$log" build "$sub" --release "$SKIP"; then return 0; fi
 
-            # 不依赖 flag 是否存在：wrapper 已在构建前升级，直接用原生命令
-            echo "::warning::$sub 带跳过 flag 失败，改用已升级 wrapper 的原生命令重试"
-            if run_flutter "$log" build "$sub" --release; then return 0; fi
+            # 情形 A：当前 Flutter 不认识该隐藏 flag（老 SDK）
+            if grep -qiE "Could not find an option named|Unknown option|unrecognized option|not a known option|Unknown flag" "$log"; then
+              echo "::warning::$sub 的跳过 flag 不被识别，改用原生命令"
+              n=$((n+1)); log="${base}_${n}.log"
+              if run_flutter "$log" build "$sub" --release; then return 0; fi
+            fi
 
-            # 若手动填了更新的 Flutter，最低版本可能更高：从报错提取后再升一次
+            # 情形 B：校验没被绕过（换了更新的 Flutter 时可能出现）
             if grep -q "minimum supported version of" "$log"; then
               MIN=$(sed -n 's/.*minimum supported version of \([0-9][0-9.]*[0-9]\).*/\1/p' "$log" | head -1)
               if [ -n "$MIN" ] && [ -f "$W" ]; then
-                echo "::warning::按报错把 Gradle wrapper 升级到 $MIN 后再次重试"
-                sed -i -E "s#gradle-[0-9][0-9.]*-(bin|all)\.zip#gradle-${MIN}-\1.zip#" "$W"
+                echo "::warning::按报错把 wrapper 升级到 gradle-${MIN}-bin.zip 后重试"
+                sed -i -E "s#gradle-[0-9][0-9.]*-(bin|all)\.zip#gradle-${MIN}-bin.zip#" "$W"
                 grep distributionUrl "$W" || true
-                if run_flutter "$log" build "$sub" --release; then return 0; fi
+                n=$((n+1)); log="${base}_${n}.log"
+                if run_flutter "$log" build "$sub" --release "$SKIP"; then return 0; fi
               fi
             fi
 
-            echo "::error::$sub 构建失败，日志尾部："
-            tail -60 "$log"
+            # 情形 C：Gradle 分发包下载 404（v5 就是死在这里）
+            # 先恢复原始 wrapper（8.11.1 已验证可下载），再带 flag 重试；
+            # 仍不行就把 -all.zip 改成 -bin.zip 再试。
+            if grep -qiE "FileNotFoundException|downloading artifacts from the network|Could not GET|404" "$log"; then
+              if [ -f "$ORIG" ]; then
+                echo "::warning::Gradle 分发包下载失败，恢复项目原始 wrapper 后重试"
+                cp "$ORIG" "$W"
+                n=$((n+1)); log="${base}_${n}.log"
+                if run_flutter "$log" build "$sub" --release "$SKIP"; then return 0; fi
+              fi
+              echo "::warning::尝试把 -all.zip 换成 -bin.zip"
+              sed -i -E 's#-(bin|all)\.zip#-bin.zip#' "$W"
+              grep distributionUrl "$W" || true
+              n=$((n+1)); log="${base}_${n}.log"
+              if run_flutter "$log" build "$sub" --release "$SKIP"; then return 0; fi
+            fi
+
+            echo "::error::$sub 构建失败，最后一次尝试的日志尾部："
+            tail -60 "$log" || true
             return 1
           }
           build_target apk || exit 1
@@ -283,9 +317,15 @@ jobs:
           echo "===== gradle wrapper ====="
           cat android/gradle/wrapper/gradle-wrapper.properties || true
           echo "===== build logs ====="
-          for f in /tmp/proxypin_apk.log /tmp/proxypin_appbundle.log; do
-            [ -f "$f" ] && { echo "--- $f"; tail -60 "$f"; }
+          # 旧写法 `[ -f ] && {...}` 在文件缺失时返回 1，会让诊断步骤自己
+          # exit 1（日志末尾那条红字就是它）。改成 if + 末尾 true。
+          for f in /tmp/proxypin_*.log; do
+            if [ -f "$f" ]; then
+              echo "--- $f"
+              tail -60 "$f" || true
+            fi
           done
+          true
 
       - uses: actions/upload-artifact@v5
         with:
