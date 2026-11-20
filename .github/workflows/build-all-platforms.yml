@@ -1,42 +1,43 @@
 # =============================================================================
-# ProxyPin 全平台自动构建 v8（修复 --split-per-abi 与 ndk abiFilters 冲突）
+# ProxyPin 全平台自动构建 v9（修复 x86 尝试把已成功的分架构包拖垮）
 #
 # 放到 fork 仓库：.github/workflows/build-all-platforms.yml
 #
-# 日志来源：logs_121012312456.zip（run 44707704940，v7）
-# 通用 APK / AAB + Windows / macOS / iOS / Linux 四个平台全部成功，
-# 只有新增的 `flutter build apk --release --split-per-abi` 失败：
+# 日志来源：logs_121020127011.zip（run build-5，v8）
+# v8 的 abiFilters 补丁已经生效，日志明确显示三个分架构 APK 全部构建成功：
+#   ✓ app-armeabi-v7a-release.apk (19.5MB)
+#   ✓ app-arm64-v8a-release.apk   (19.5MB)
+#   ✓ app-x86_64-release.apk      (19.5MB)
+# 通用 APK / AAB 也成功。但紧接着的 x86 32 位尝试报：
 #
-#   Build file '.../android/build.gradle' line: 48
-#   Conflicting configuration : 'armeabi-v7a,arm64-v8a,x86_64' in ndk abiFilters
-#   cannot be present when splits abi filters are set :
-#   armeabi-v7a,x86_64,arm64-v8a
+#   "android-x86" is not an allowed value for option "--target-platform".
+#   ##[error]Process completed with exit code 64.
 #
-# 根因：上游在 android/build.gradle 里给 :app 注入了 ndk.abiFilters（三个 ABI），
-# 而 Flutter 的 --split-per-abi 会设置 splits.abi filters；AGP 规定两者不能共存。
-# 这和 Gradle 版本、下载 404 都无关，是纯配置冲突。
+# 致命点不在「x86 不支持」（这个早就说明过），而在 GitHub runner 的 shell 是
+# `bash -e -o pipefail`：v8 那条裸管道 `flutter ... | tee` 返回 64，
+# `set -e` 在 `X86_RC=${PIPESTATUS[0]}` 执行前就杀掉了整个步骤，
+# 于是 ABI 对照表、ls、Collect artifacts、upload-artifact 全被跳过，
+# Android job 标红 -> Release 守卫挡住发版（汇总只收到 3 个 Artifact）。
+# macOS 也因 run 被取消而没传产物。
 #
-# v8 修复：
-#  - 新增 `Android ABI compatibility patch` 步骤，放在通用包构建完成之后、
-#    分架构构建之前：扫描 android/**/*.gradle(.kts)，把 ndk abiFilters 语句
-#    （含跨行续行）注释掉，让 Flutter 注入的 splits.abi 生效。
-#  - 通用包 / AAB 已用项目原配置构建并先复制到 dist，不受此改动影响。
-#  - 分架构步骤增加 `Conflicting configuration` 兜底重试（幂等再打一次补丁），
-#    并修正 x86 32 位尝试里 `| tee` 导致 PIPESTATUS 丢失的误判。
+# v9 修复：
+#  - x86 段改成「先查 --target-platform allowed values，不支持就完全不跑」，
+#    支持时也用 if 包住管道，任何失败都不外溢；步骤末尾显式 `true`。
+#  - ABI 对照表移到 x86 尝试之前先落盘，保证产物一定齐全。
+#  - 修 python 补丁脚本：目录名也可能以 .gradle 结尾（android/.gradle），
+#    加 is_file() 过滤，消掉 `skip ... Is a directory`。
+#  - 修 build_target 里 `local sub="$1" base="/tmp/proxypin_${sub}"` 同行展开
+#    导致 base 变成 `/tmp/proxypin_` 的小 bug（日志里 /tmp/proxypin__1.log）。
 #
 # 产物（Android）：
-#   proxypin-android-<ver>.apk                通用包
-#   proxypin-android-<ver>.aab               Play 商店包
-#   proxypin-android-<ver>-arm64-v8a.apk     ARM64
-#   proxypin-android-<ver>-armeabi-v7a.apk   ARM32
-#   proxypin-android-<ver>-x86_64.apk        x86 64 位
-#   BUILD_INFO_android_abi.txt               ABI 对照表
-#   x86 32 位：Flutter 3.47.9 已移除 android-x86 engine，仅尝试、不造假包。
+#   通用包 .apk / .aab + arm64-v8a / armeabi-v7a / x86_64 三个分架构包
+#   + BUILD_INFO_android_abi.txt 对照表
+#   x86 32 位：当前 Flutter 不接受该 target-platform，只记录说明、不发假包。
 #
-# 保留全部已验证修复：保持原 Gradle 8.11.1 + 官方跳过 flag、404 恢复
-# wrapper、Diagnostics 不自曝 exit 1、Flutter 3.47.9、windows-2022 +
-# coroutine 抑制宏、Linux -Werror 降级 + 合并打包、CI 签名、Action v5、
-# Release 需五个平台全成功才发布。
+# 保留全部已验证修复：ndk abiFilters 冲突补丁、保持原 Gradle 8.11.1 +
+# 官方跳过 flag、404 恢复 wrapper、Diagnostics 不自曝 exit 1、Flutter 3.47.9、
+# windows-2022 + coroutine 抑制宏、Linux -Werror 降级 + 合并打包、CI 签名、
+# Action v5、Release 需五个平台全成功才发布。
 #
 # 默认 checkout 上游 wanghongenpin/proxypin 的 main；想编译自己 fork 的改动，
 # 手动运行时把 source_repo 改成你的仓库、ref 改分支。
@@ -244,8 +245,9 @@ jobs:
             return "${PIPESTATUS[0]}"
           }
           build_target() {
-            local sub="$1" base="/tmp/proxypin_${sub}" n=0 log=""
+            local sub="$1" n=0 log=""
             local MIN=""
+            local base="/tmp/proxypin_${sub}"
 
             # 第 1 次：带跳过 flag（已验证 flutter 接受且能绕过 Gradle 校验）
             n=$((n+1)); log="${base}_${n}.log"
@@ -307,6 +309,8 @@ jobs:
               files.extend(pathlib.Path('android').rglob(pat))
           total = 0
           for f in sorted(set(files)):
+              if not f.is_file():   # 目录也可能叫 .gradle（android/.gradle）
+                  continue
               try:
                   lines = f.read_text(errors='ignore').splitlines(keepends=True)
               except Exception as e:
@@ -414,27 +418,9 @@ jobs:
           [ "$COUNT" -ge 1 ] || { echo "::error::一个分架构 APK 都没产出"; exit 1; }
           if [ "$COUNT" -lt 3 ]; then echo "::warning::只产出 $COUNT/3 个分架构包"; fi
 
-          # x86 (32 位) 单独尝试：现代 Flutter 已移除 android-x86 engine。
-          # 用 PIPESTATUS 取 flutter 真实退出码，避免 | tee 把失败吞成 0。
-          X86LOG=/tmp/proxypin_x86.log
-          echo ">>> flutter build apk --release --split-per-abi --target-platform android-x86 $SKIP"
-          X86_OK=false
-          flutter build apk --release --split-per-abi --target-platform android-x86 "$SKIP" 2>&1 | tee "$X86LOG"
-          X86_RC=${PIPESTATUS[0]}
-          if [ "$X86_RC" -eq 0 ]; then
-            X86SRC="$OUT/app-x86-release.apk"
-            if [ -f "$X86SRC" ] && unzip -l "$X86SRC" | grep -q 'lib/x86/libflutter.so'; then
-              cp "$X86SRC" "dist/proxypin-android-${APP_VERSION}-x86.apk"
-              echo "::notice::x86 (32 位) APK 已生成"
-              X86_OK=true
-            fi
-          fi
-          if [ "$X86_OK" = false ]; then
-            echo "::notice::x86 (32 位) 未发布：当前 Flutter 不再提供 android-x86 engine，官方仅支持 arm64-v8a / armeabi-v7a / x86_64"
-            grep -iE "x86|unsupported|not supported|invalid" "$X86LOG" | head -8 || true
-          fi
-
-          # ABI 对照表随 Artifact / Release 一起发布
+          # === ABI 对照表先落盘 ===
+          # 放在 x86 尝试之前：即便后续任何尝试异常，3 个分架构包 + 通用包
+          # + AAB + 对照表都已在 dist，步骤不会被拖垮。
           {
             echo "ProxyPin Android ABI 对照表 (${APP_VERSION})"
             echo ""
@@ -443,13 +429,40 @@ jobs:
             echo "  proxypin-android-${APP_VERSION}-x86_64.apk      = x86 64 位       模拟器 / Chromebook"
             echo "  proxypin-android-${APP_VERSION}.apk             = 通用包 (含全部受支持 ABI)"
             echo "  proxypin-android-${APP_VERSION}.aab             = Play 商店包 (由 Play 按 ABI 自动拆分)"
-            if [ "$X86_OK" = true ]; then
-              echo "  proxypin-android-${APP_VERSION}-x86.apk         = x86 32 位 (本次 SDK 仍支持)"
-            else
-              echo "  x86 32 位: 本次未生成 —— Flutter 已移除 android-x86 engine"
-            fi
           } > "dist/BUILD_INFO_android_abi.txt"
           ls -lh dist
+
+          # === x86 (32 位)：探测式、完全非致命 ===
+          # v8 日志实测 Flutter 3.47.9 直接报
+          #   "android-x86" is not an allowed value for option "--target-platform"
+          # 且 runner 是 `bash -e -o pipefail`，裸管道 exit 64 会杀掉整个步骤，
+          # 把已构建成功的 3 个分架构包全部拖垮（v8 就是这么红的）。
+          # v9：先查 allowed values，不支持就干脆不跑；支持时用 if 包住管道，
+          # 任何失败都不会外溢。
+          X86_OK=false
+          HELP=$(flutter build apk --help 2>&1 || true)
+          if printf '%s' "$HELP" | grep -qi 'android-x86'; then
+            X86LOG=/tmp/proxypin_x86.log
+            echo ">>> flutter build apk --release --split-per-abi --target-platform android-x86 $SKIP"
+            if flutter build apk --release --split-per-abi --target-platform android-x86 "$SKIP" 2>&1 | tee "$X86LOG"; then
+              X86SRC="$OUT/app-x86-release.apk"
+              if [ -f "$X86SRC" ] && unzip -l "$X86SRC" | grep -q 'lib/x86/libflutter.so'; then
+                cp "$X86SRC" "dist/proxypin-android-${APP_VERSION}-x86.apk"
+                echo "::notice::x86 (32 位) APK 已生成"
+                X86_OK=true
+              fi
+            fi
+            if [ "$X86_OK" = false ] && [ -f "$X86LOG" ]; then
+              grep -iE 'allowed value|unsupported|not supported|invalid' "$X86LOG" | head -8 || true
+            fi
+          fi
+          if [ "$X86_OK" = true ]; then
+            echo "  proxypin-android-${APP_VERSION}-x86.apk         = x86 32 位 (本次 SDK 仍支持)" >> "dist/BUILD_INFO_android_abi.txt"
+          else
+            echo "::notice::x86 (32 位) 未发布：当前 Flutter 不接受 android-x86 target-platform，官方仅支持 arm64-v8a / armeabi-v7a / x86_64"
+            echo "  x86 32 位: 本次未生成 —— 当前 Flutter 不接受 android-x86 target-platform" >> "dist/BUILD_INFO_android_abi.txt"
+          fi
+          true
 
       - name: Collect artifacts
         shell: bash
