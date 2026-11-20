@@ -1,30 +1,42 @@
 # =============================================================================
-# ProxyPin 全平台自动构建 v7（新增按 ABI 拆分的 Android APK）
+# ProxyPin 全平台自动构建 v8（修复 --split-per-abi 与 ndk abiFilters 冲突）
 #
 # 放到 fork 仓库：.github/workflows/build-all-platforms.yml
 #
-# v6 已验证全平台构建成功。v7 在 Android 之外再产出按 CPU 架构拆分的 APK：
+# 日志来源：logs_121012312456.zip（run 44707704940，v7）
+# 通用 APK / AAB + Windows / macOS / iOS / Linux 四个平台全部成功，
+# 只有新增的 `flutter build apk --release --split-per-abi` 失败：
 #
-#   proxypin-android-<ver>-arm64-v8a.apk    ARM64 / 64 位（现代真机）
-#   proxypin-android-<ver>-armeabi-v7a.apk  ARM32 / 32 位（老设备）
-#   proxypin-android-<ver>-x86_64.apk       x86  / 64 位（模拟器、Chromebook）
-#   proxypin-android-<ver>.apk              通用包（含全部受支持 ABI）
-#   proxypin-android-<ver>.aab              Play 商店包（Play 自动按 ABI 拆分）
+#   Build file '.../android/build.gradle' line: 48
+#   Conflicting configuration : 'armeabi-v7a,arm64-v8a,x86_64' in ndk abiFilters
+#   cannot be present when splits abi filters are set :
+#   armeabi-v7a,x86_64,arm64-v8a
 #
-# 关于 x86 32 位：Flutter 3.35 起把 Android x86 32 位标记为 deprecated，
-# 后续版本移除了 android-x86 engine；`--split-per-abi` 现在只产出上面 3 个
-# 包。workflow 会单独尝试 `--target-platform android-x86`，并且只有确认
-# APK 里真的含 lib/x86/libflutter.so 才发布；否则只打 notice，不造假包、
-# 不拖垮主构建。
+# 根因：上游在 android/build.gradle 里给 :app 注入了 ndk.abiFilters（三个 ABI），
+# 而 Flutter 的 --split-per-abi 会设置 splits.abi filters；AGP 规定两者不能共存。
+# 这和 Gradle 版本、下载 404 都无关，是纯配置冲突。
 #
-# 新增步骤沿用 v6 的跳过 flag / wrapper 备份回退逻辑；先落盘通用包再跑
-# 拆分构建，避免后续 Gradle 任务清理输出目录。Release 的 files 里已有
-# dist/*.apk，新增包会自动发布，无需改 Release 段。
+# v8 修复：
+#  - 新增 `Android ABI compatibility patch` 步骤，放在通用包构建完成之后、
+#    分架构构建之前：扫描 android/**/*.gradle(.kts)，把 ndk abiFilters 语句
+#    （含跨行续行）注释掉，让 Flutter 注入的 splits.abi 生效。
+#  - 通用包 / AAB 已用项目原配置构建并先复制到 dist，不受此改动影响。
+#  - 分架构步骤增加 `Conflicting configuration` 兜底重试（幂等再打一次补丁），
+#    并修正 x86 32 位尝试里 `| tee` 导致 PIPESTATUS 丢失的误判。
 #
-# 保留 v6 全部修复：保持项目原有 Gradle 8.11.1 + 官方跳过 flag、
-# 404 恢复原始 wrapper、Diagnostics 不自曝 exit 1、Flutter 3.47.9、
-# windows-2022 + coroutine 抑制宏、Linux -Werror 降级 + 合并打包、
-# CI 签名、Action v5、Release 需五个平台全成功才发布。
+# 产物（Android）：
+#   proxypin-android-<ver>.apk                通用包
+#   proxypin-android-<ver>.aab               Play 商店包
+#   proxypin-android-<ver>-arm64-v8a.apk     ARM64
+#   proxypin-android-<ver>-armeabi-v7a.apk   ARM32
+#   proxypin-android-<ver>-x86_64.apk        x86 64 位
+#   BUILD_INFO_android_abi.txt               ABI 对照表
+#   x86 32 位：Flutter 3.47.9 已移除 android-x86 engine，仅尝试、不造假包。
+#
+# 保留全部已验证修复：保持原 Gradle 8.11.1 + 官方跳过 flag、404 恢复
+# wrapper、Diagnostics 不自曝 exit 1、Flutter 3.47.9、windows-2022 +
+# coroutine 抑制宏、Linux -Werror 降级 + 合并打包、CI 签名、Action v5、
+# Release 需五个平台全成功才发布。
 #
 # 默认 checkout 上游 wanghongenpin/proxypin 的 main；想编译自己 fork 的改动，
 # 手动运行时把 source_repo 改成你的仓库、ref 改分支。
@@ -282,6 +294,59 @@ jobs:
           build_target apk || exit 1
           build_target appbundle || exit 1
 
+      # === 修复：项目 ndk abiFilters 与 Flutter splits.abi 冲突 ===
+      # 通用包 / AAB 上一步已构建完成，这里只在分架构构建前去掉 abiFilters。
+      - name: Android ABI compatibility patch
+        shell: bash
+        run: |
+          set -e
+          cat > /tmp/patch_abi.py <<'PY'
+          import pathlib, re
+          files = []
+          for pat in ('*.gradle', '*.gradle.kts'):
+              files.extend(pathlib.Path('android').rglob(pat))
+          total = 0
+          for f in sorted(set(files)):
+              try:
+                  lines = f.read_text(errors='ignore').splitlines(keepends=True)
+              except Exception as e:
+                  print('skip', f, e)
+                  continue
+              out, i, changed = [], 0, 0
+              while i < len(lines):
+                  line = lines[i]
+                  # 只处理未注释的 abiFilters 语句；已注释的（本脚本自己加的）跳过
+                  if re.search(r'\babiFilters\b', line) and not line.lstrip().startswith('//'):
+                      block = [line]
+                      j = i
+                      # Groovy/Kotlin 列表允许跨行：只要上一行以逗号结尾就继续吞
+                      while True:
+                          stripped = re.sub(r'//.*$', '', block[-1]).rstrip()
+                          if stripped.endswith(',') and j + 1 < len(lines):
+                              j += 1
+                              block.append(lines[j])
+                          else:
+                              break
+                      for b in block:
+                          out.append('// ' + b.lstrip())
+                      changed += len(block)
+                      i = j + 1
+                  else:
+                      out.append(line)
+                      i += 1
+              if changed:
+                  f.write_text(''.join(out))
+                  total += changed
+                  print('patched', f, changed, 'line(s)')
+          print('total abiFilters lines commented:', total)
+          if total == 0:
+              print('::notice::未发现 ndk abiFilters（项目可能已改），跳过')
+          PY
+          python3 /tmp/patch_abi.py
+          echo "===== 残留未注释 abiFilters 检查（应为空）====="
+          { grep -rn --include='*.gradle' --include='*.gradle.kts' 'abiFilters' android || true; } \
+            | grep -v ':[0-9]*:[[:space:]]*//' || true
+
       # === 按 ABI 拆分 APK ===
       - name: Build per-ABI APKs
         shell: bash
@@ -312,6 +377,14 @@ jobs:
             echo "::warning::跳过 flag 不被识别，改用原生命令"
             if try_split build apk --release --split-per-abi; then split_ok=true; fi
           fi
+
+          # 若上游 gradle 写法未被补丁覆盖，按报错再幂等打一次并重试
+          if [ "$split_ok" = false ] && grep -qi "Conflicting configuration" "$LOG" && [ -f /tmp/patch_abi.py ]; then
+            echo "::warning::检测到 ndk abiFilters / splits 冲突，重新打补丁并重试"
+            python3 /tmp/patch_abi.py
+            if try_split build apk --release --split-per-abi "$SKIP"; then split_ok=true; fi
+          fi
+
           if [ "$split_ok" = false ] && grep -qiE "FileNotFoundException|downloading artifacts from the network|Could not GET|404" "$LOG" && [ -f "$ORIG" ]; then
             echo "::warning::Gradle 分发包下载失败，恢复原始 wrapper 后重试"
             cp "$ORIG" "$W"
@@ -342,11 +415,13 @@ jobs:
           if [ "$COUNT" -lt 3 ]; then echo "::warning::只产出 $COUNT/3 个分架构包"; fi
 
           # x86 (32 位) 单独尝试：现代 Flutter 已移除 android-x86 engine。
-          # 失败只告警；即便命令返回 0，也必须校验 APK 内确有 32 位 x86 引擎。
+          # 用 PIPESTATUS 取 flutter 真实退出码，避免 | tee 把失败吞成 0。
           X86LOG=/tmp/proxypin_x86.log
           echo ">>> flutter build apk --release --split-per-abi --target-platform android-x86 $SKIP"
           X86_OK=false
-          if flutter build apk --release --split-per-abi --target-platform android-x86 "$SKIP" 2>&1 | tee "$X86LOG"; then
+          flutter build apk --release --split-per-abi --target-platform android-x86 "$SKIP" 2>&1 | tee "$X86LOG"
+          X86_RC=${PIPESTATUS[0]}
+          if [ "$X86_RC" -eq 0 ]; then
             X86SRC="$OUT/app-x86-release.apk"
             if [ -f "$X86SRC" ] && unzip -l "$X86SRC" | grep -q 'lib/x86/libflutter.so'; then
               cp "$X86SRC" "dist/proxypin-android-${APP_VERSION}-x86.apk"
